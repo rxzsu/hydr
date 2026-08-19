@@ -1,0 +1,19 @@
+# hydr-client example config
+password: "change-me"
+
+# target send rate in bits/s (0 = default congestion control)
+cc_rx: 0
+
+# local SOCKS5 entry
+socks5_bind: "127.0.0.1:1080"
+
+transport:
+  type: quic
+  addr: "1.2.3.4:8443"
+  server_name: "example.com"
+  insecure: true
+# or WebSocket:
+#   type: ws
+#   url: "wss://example.com/hydr"
+#   insecure: false
+#   obfuscation: "my-secret-key"

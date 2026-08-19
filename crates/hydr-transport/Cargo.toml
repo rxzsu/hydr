@@ -1,0 +1,16 @@
+[package]
+name = "hydr-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+futures-util = "0.3.34"
+hydr-core = { version = "0.1.0", path = "../hydr-core" }
+quinn = "0.11.11"
+rcgen = "0.14.9"
+rustls = { version = "0.23.43", features = ["ring"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-tungstenite = { version = "0.30.0", features = ["connect", "rustls-tls-webpki-roots"] }
+tracing = "0.1.44"
+webpki-roots = "1.0.9"

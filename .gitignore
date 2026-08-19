@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# Справочный клон upstream (apernet/hysteria), не часть проекта
+/hysteria-reference
+
+# Логи
+*.log
+
+# Редакторы/ОС
+.idea/
+.vscode/
+*.swp
+Thumbs.db

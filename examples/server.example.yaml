@@ -1,0 +1,29 @@
+# hydr-server example config
+password: "change-me"
+
+# target receive rate in bits/s (0 = default congestion control)
+cc_rx: 0
+
+quic:
+  bind: "0.0.0.0:8443"
+  server_name: "example.com"
+
+ws:
+  bind: "0.0.0.0:8080"
+  path: "/hydr"
+  # optional obfuscation key (must match client)
+  # obfuscation: "my-secret-key"
+
+# optional multi-hop relay
+# next_hop:
+#   password: "hop-password"
+#   transport:
+#     type: quic
+#     addr: "2.2.2.2:8443"
+#     server_name: "hop.example.com"
+#     insecure: true
+#   # or:
+#   # type: ws
+#   # url: "wss://hop.example.com/hydr"
+#   # insecure: false
+#   # obfuscation: "my-secret-key"
