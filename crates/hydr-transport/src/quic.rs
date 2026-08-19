@@ -225,6 +225,7 @@ pub fn default_transport_config() -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.max_concurrent_bidi_streams(1024u32.into());
     cfg.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    cfg.max_idle_timeout(Some(quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).unwrap()));
     cfg
 }
 

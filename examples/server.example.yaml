@@ -4,6 +4,9 @@ password: "change-me"
 # target receive rate in bits/s (0 = default congestion control)
 cc_rx: 0
 
+# max concurrent tunnels (0 = default 1024)
+max_conns: 0
+
 quic:
   bind: "0.0.0.0:8443"
   server_name: "example.com"

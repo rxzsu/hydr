@@ -51,6 +51,7 @@ async fn spawn_quic() -> (Arc<Server>, SocketAddr) {
         quic: None,
         ws: None,
         next_hop: None,
+        max_conns: 0,
     });
     tokio::spawn(server.clone().run_quic_endpoint(ep));
     (server, addr)
@@ -80,18 +81,26 @@ async fn connect_client(server_quic: SocketAddr, bind: SocketAddr) -> Arc<Client
 }
 
 async fn socks5_connect(proxy: SocketAddr, target: &Address) -> TcpStream {
-    let mut s = TcpStream::connect(proxy).await.unwrap();
-    s.write_all(&[5, 1, 0]).await.unwrap();
+    try_socks5_connect(proxy, target).await.expect("socks5 connect")
+}
+
+async fn try_socks5_connect(proxy: SocketAddr, target: &Address) -> std::io::Result<TcpStream> {
+    let mut s = TcpStream::connect(proxy).await?;
+    s.write_all(&[5, 1, 0]).await?;
     let mut resp = [0u8; 2];
-    s.read_exact(&mut resp).await.unwrap();
-    assert_eq!(resp, [5, 0], "no-auth method");
+    s.read_exact(&mut resp).await?;
+    if resp != [5, 0] {
+        return Err(std::io::Error::other("no acceptable auth method"));
+    }
     let mut req = vec![5, 1, 0];
     target.encode(&mut req);
-    s.write_all(&req).await.unwrap();
+    s.write_all(&req).await?;
     let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply[1], 0, "connect succeeded");
-    s
+    s.read_exact(&mut reply).await?;
+    if reply[1] != 0 {
+        return Err(std::io::Error::other("connect refused"));
+    }
+    Ok(s)
 }
 
 async fn socks5_udp_associate(proxy: SocketAddr) -> (TcpStream, SocketAddr) {
@@ -133,10 +142,51 @@ async fn socks5_tcp_end_to_end() {
 
     let target = Address::Ip(echo.ip(), echo.port());
     let mut s = socks5_connect(socks5_addr, &target).await;
-    s.write_all(b"hello via socks5").await.unwrap();
-    let mut buf = vec![0u8; 16];
+    s.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
     s.read_exact(&mut buf).await.unwrap();
-    assert_eq!(buf, b"hello via socks5");
+    assert_eq!(&buf, b"hello");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_reconnects_after_tunnel_close() {
+    let (echo, _eh) = echo_tcp().await;
+    let (_server, quic_addr) = spawn_quic().await;
+
+    let client = connect_client(quic_addr, "127.0.0.1:0".parse().unwrap()).await;
+    let listener = client.socks5_listener().await.unwrap();
+    let socks5_addr = listener.local_addr().unwrap();
+    tokio::spawn(client.clone().serve_datagrams());
+    tokio::spawn(client.clone().run_socks5_on(listener));
+
+    let target = Address::Ip(echo.ip(), echo.port());
+
+    async fn round(socks5_addr: SocketAddr, target: &Address, payload: &[u8]) {
+        let mut s = socks5_connect(socks5_addr, target).await;
+        s.write_all(payload).await.unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, payload);
+    }
+
+    round(socks5_addr, &target, b"before").await;
+
+    client.force_close().await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut reconnected = false;
+    while Instant::now() < deadline {
+        if let Ok(mut s) = try_socks5_connect(socks5_addr, &target).await {
+            s.write_all(b"after").await.unwrap();
+            let mut buf = [0u8; 5];
+            if s.read_exact(&mut buf).await.is_ok() && &buf == b"after" {
+                reconnected = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(reconnected, "клиент должен переподключиться после обрыва");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1,6 +1,8 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hydr_core::message::{AuthRequest, AuthResponse, Datagram, FEATURE_UDP, STATUS_ERR, STATUS_OK};
 use hydr_transport::{quic, ws, DynStream, ServerEvent, Tunnel, TunnelHandle};
@@ -10,12 +12,21 @@ mod udp;
 
 pub use udp::UdpManager;
 
+const DEFAULT_MAX_CONNS: usize = 1024;
+/// Окно и лимит попыток аутентификации на один IP (анти-брутфорс).
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
+const AUTH_MAX_PER_IP: usize = 30;
+/// Таймаут WS-хендшейка (TLS + WebSocket upgrade + auth).
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct ServerConfig {
     pub password: String,
     pub cc_rx: u64,
     pub quic: Option<QuicListen>,
     pub ws: Option<WsListen>,
     pub next_hop: Option<NextHop>,
+    /// Максимум одновременных туннелей (0 — значение по умолчанию).
+    pub max_conns: usize,
 }
 
 #[derive(Clone)]
@@ -55,14 +66,25 @@ pub struct Server {
     config: ServerConfig,
     downstream: Mutex<Option<TunnelHandle>>,
     udp: Arc<UdpManager>,
+    conn_permits: Arc<tokio::sync::Semaphore>,
+    auth_attempts: std::sync::Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    conns_active: AtomicU64,
 }
 
 impl Server {
     pub fn new(config: ServerConfig) -> Arc<Self> {
+        let max_conns = if config.max_conns == 0 {
+            DEFAULT_MAX_CONNS
+        } else {
+            config.max_conns
+        };
         Arc::new(Self {
             config,
             downstream: Mutex::new(None),
             udp: UdpManager::new(),
+            conn_permits: Arc::new(tokio::sync::Semaphore::new(max_conns)),
+            auth_attempts: std::sync::Mutex::new(HashMap::new()),
+            conns_active: AtomicU64::new(0),
         })
     }
 
@@ -72,6 +94,35 @@ impl Server {
         } else {
             Ok(AuthResponse::error("invalid credentials"))
         }
+    }
+
+    /// Рейт-лимит попыток аутентификации по IP.
+    fn rate_allow(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut m = self.auth_attempts.lock().unwrap();
+        let v = m.entry(ip).or_default();
+        v.retain(|t| now.duration_since(*t) < AUTH_WINDOW);
+        if v.len() >= AUTH_MAX_PER_IP {
+            return false;
+        }
+        v.push(now);
+        true
+    }
+
+    /// Снимает/возвращает место под новый туннель.
+    fn try_take_conn(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match Arc::clone(&self.conn_permits).try_acquire_owned() {
+            Ok(p) => {
+                self.conns_active.fetch_add(1, Ordering::Relaxed);
+                Some(p)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn release_conn(permit: tokio::sync::OwnedSemaphorePermit, active: &AtomicU64) {
+        active.fetch_sub(1, Ordering::Relaxed);
+        drop(permit);
     }
 
     pub async fn run(self: Arc<Self>) -> hydr_core::Result<()> {
@@ -137,6 +188,11 @@ impl Server {
                 Some(i) => i,
                 None => break,
             };
+            let peer = incoming.remote_address();
+            if !self.rate_allow(peer.ip()) {
+                tracing::warn!("auth rate limit exceeded for {peer}");
+                continue;
+            }
             let server = self.clone();
             tokio::spawn(async move {
                 let conn = match incoming.await {
@@ -185,13 +241,17 @@ impl Server {
     ) {
         tracing::info!("WS listening on {}", listener.local_addr().unwrap());
         loop {
-            let (tcp, _) = match listener.accept().await {
+            let (tcp, peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("ws accept failed: {e}");
                     continue;
                 }
             };
+            if !self.rate_allow(peer.ip()) {
+                tracing::warn!("auth rate limit exceeded for {peer}");
+                continue;
+            }
             let server = self.clone();
             let path = path.clone();
             let ob = obfuscation
@@ -202,19 +262,33 @@ impl Server {
                     let s = server.clone();
                     Arc::new(move |r: &AuthRequest| s.validate(r))
                 };
-                let (tunnel, _req) = match ws::accept_with_obfuscation(tcp, &path, val, ob).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::debug!("ws auth failed: {e}");
-                        return;
-                    }
-                };
+                let handshake = ws::accept_with_obfuscation(tcp, &path, val, ob);
+                let (tunnel, _req) =
+                    match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, handshake).await {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            tracing::debug!("ws auth failed: {e}");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!("ws handshake timed out");
+                            return;
+                        }
+                    };
                 server.handle_tunnel(Tunnel::Ws(tunnel)).await;
             });
         }
     }
 
     async fn handle_tunnel(self: Arc<Self>, tunnel: Tunnel) {
+        let Some(permit) = self.try_take_conn() else {
+            tracing::warn!(
+                "connection rejected: {} concurrent tunnels",
+                self.conns_active.load(Ordering::Relaxed)
+            );
+            tunnel.close().await;
+            return;
+        };
         let handle = TunnelHandle::from_tunnel(&tunnel);
 
         if self.config.next_hop.is_some() {
@@ -222,6 +296,7 @@ impl Server {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("next-hop connect failed: {e}");
+                    Self::release_conn(permit, &self.conns_active);
                     return;
                 }
             };
@@ -263,6 +338,7 @@ impl Server {
                 }
             }
         }
+        Self::release_conn(permit, &server.conns_active);
     }
 
     async fn connect_next_hop(&self) -> hydr_core::Result<Tunnel> {

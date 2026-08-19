@@ -46,6 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Arc::new(client);
 
     tokio::spawn(client.clone().serve_datagrams());
-    client.run_socks5().await?;
+    tokio::select! {
+        r = client.run_socks5() => r?,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutdown signal received");
+        }
+    }
     Ok(())
 }

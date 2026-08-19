@@ -24,6 +24,9 @@ pub struct ServerFile {
     /// Целевая полоса приёма в бит/с (0 — дефолтный congestion control)
     #[serde(default)]
     pub cc_rx: Option<u64>,
+    /// Максимум одновременных туннелей (0 — значение по умолчанию 1024)
+    #[serde(default)]
+    pub max_conns: Option<usize>,
     #[serde(default)]
     pub quic: Option<QuicFile>,
     #[serde(default)]

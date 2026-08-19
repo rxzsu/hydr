@@ -59,6 +59,11 @@ impl WsHandle {
         let _ = self.cmd.try_send(Cmd::SendFrame(frame));
         Ok(())
     }
+
+    /// Закрывает WS-соединение (останавливает цикл `run`).
+    pub fn close(&self) -> Result<()> {
+        self.cmd.try_send(Cmd::Close).map_err(|_| Error::StreamClosed)
+    }
 }
 
 pub struct WsTunnel {
@@ -96,6 +101,7 @@ pub(crate) enum Cmd {
         a_read: WsRead,
         a_write: WsWrite,
     },
+    Close,
 }
 
 struct PendingOpen {
@@ -419,6 +425,7 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                             Err(_) => false,
                         }
                     }
+                    Cmd::Close => false,
                 };
                 if !done {
                     break;

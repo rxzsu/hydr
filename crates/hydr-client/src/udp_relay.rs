@@ -17,13 +17,13 @@ struct RelaySession {
 }
 
 pub struct UdpRelay {
-    tunnel: TunnelHandle,
+    tunnel: Arc<tokio::sync::RwLock<TunnelHandle>>,
     sessions: Mutex<HashMap<u32, RelaySession>>,
     next_session: AtomicU32,
 }
 
 impl UdpRelay {
-    pub fn new(tunnel: TunnelHandle) -> Self {
+    pub fn new(tunnel: Arc<tokio::sync::RwLock<TunnelHandle>>) -> Self {
         Self {
             tunnel,
             sessions: Mutex::new(HashMap::new()),
@@ -70,7 +70,7 @@ impl UdpRelay {
                             }
                         }
                         let dg = Datagram::new(sid, target, payload.to_vec());
-                        if relay.tunnel.send_datagram(&dg).is_err() {
+                        if relay.tunnel.read().await.send_datagram(&dg).is_err() {
                             break;
                         }
                     }

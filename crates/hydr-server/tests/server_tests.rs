@@ -50,6 +50,7 @@ fn base_config() -> ServerConfig {
         quic: None,
         ws: None,
         next_hop: None,
+        max_conns: 0,
     }
 }
 

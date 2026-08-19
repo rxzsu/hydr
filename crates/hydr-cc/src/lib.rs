@@ -97,6 +97,8 @@ pub fn transport_config(rate_bps: u64) -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.max_concurrent_bidi_streams(1024u32.into());
     cfg.keep_alive_interval(Some(Duration::from_secs(5)));
+    // мёртвые соединения закрываются через 30с; keep_alive держит живые
+    cfg.max_idle_timeout(Some(quinn::IdleTimeout::try_from(Duration::from_secs(30)).unwrap()));
     if rate_bps > 0 {
         cfg.congestion_controller_factory(Arc::new(BrutalConfig { rate_bps }));
     }

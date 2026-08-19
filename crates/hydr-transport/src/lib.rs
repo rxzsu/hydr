@@ -55,6 +55,19 @@ impl TunnelHandle {
             TunnelHandle::Ws(h) => h.send_datagram(dg),
         }
     }
+
+    /// Закрывает соединение, не трогая владеющий туннель (безопасно для
+    /// вызова из сервисных циклов, не держащих мьютекс).
+    pub fn close(&self) {
+        match self {
+            TunnelHandle::Quic(conn) => {
+                conn.close(quinn::VarInt::from_u32(0), b"bye");
+            }
+            TunnelHandle::Ws(h) => {
+                let _ = h.close();
+            }
+        }
+    }
 }
 
 pub enum ServerEvent {

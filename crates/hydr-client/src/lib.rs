@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hydr_core::message::{AuthRequest, FEATURE_UDP};
 use hydr_transport::{quic, ws, ProxyStream, Tunnel, TunnelHandle};
@@ -34,8 +35,9 @@ pub enum ClientTransport {
 }
 
 pub struct Client {
+    config: ClientConfig,
     tunnel: Mutex<Tunnel>,
-    handle: TunnelHandle,
+    handle: Arc<tokio::sync::RwLock<TunnelHandle>>,
     udp: Arc<UdpRelay>,
     socks5_bind: SocketAddr,
 }
@@ -43,41 +45,67 @@ pub struct Client {
 impl Client {
     pub async fn connect(config: ClientConfig) -> hydr_core::Result<Client> {
         hydr_transport::tls::install_default_provider();
+        let tunnel = Self::connect_tunnel(&config).await?;
+        let handle = Arc::new(tokio::sync::RwLock::new(TunnelHandle::from_tunnel(&tunnel)));
+        let udp = Arc::new(UdpRelay::new(handle.clone()));
+        let socks5_bind = config.socks5_bind;
+        Ok(Client {
+            config,
+            tunnel: Mutex::new(tunnel),
+            handle,
+            udp,
+            socks5_bind,
+        })
+    }
+
+    async fn connect_tunnel(config: &ClientConfig) -> hydr_core::Result<Tunnel> {
+        hydr_transport::tls::install_default_provider();
         let auth = AuthRequest::new_password(config.password.as_bytes(), config.cc_rx, FEATURE_UDP);
-        let tunnel = match &config.transport {
+        match &config.transport {
             ClientTransport::Quic {
                 addr,
                 server_name,
                 insecure,
-            } => Tunnel::Quic(
-                quic::connect(
+            } => {
+                let fut = quic::connect(
                     *addr,
                     server_name,
                     *insecure,
                     Some(hydr_cc::transport_config(config.cc_rx)),
                     &auth,
-                )
-                .await?,
-            ),
+                );
+                Ok(Tunnel::Quic(fut.await?))
+            }
             ClientTransport::Ws { url, insecure, obfuscation } => {
                 let ob = obfuscation
                     .clone()
                     .map(|k| Arc::new(hydr_core::obfuscation::Obfuscator::new(k.as_bytes())));
-                Tunnel::Ws(ws::connect_with_obfuscation(url, *insecure, &auth, ob).await?)
+                Ok(Tunnel::Ws(ws::connect_with_obfuscation(url, *insecure, &auth, ob).await?))
             }
-        };
-        let handle = TunnelHandle::from_tunnel(&tunnel);
-        let udp = Arc::new(UdpRelay::new(handle.clone()));
-        Ok(Client {
-            tunnel: Mutex::new(tunnel),
-            handle,
-            udp,
-            socks5_bind: config.socks5_bind,
-        })
+        }
     }
 
-    pub fn tunnel_handle(&self) -> TunnelHandle {
-        self.handle.clone()
+    /// Пересоздаёт туннель после обрыва и подменяет общий handle.
+    async fn reconnect(&self) -> hydr_core::Result<()> {
+        tracing::debug!("connecting tunnel");
+        let new_tunnel = Self::connect_tunnel(&self.config).await?;
+        let mut tunnel = self.tunnel.lock().await;
+        *tunnel = new_tunnel;
+        let handle = TunnelHandle::from_tunnel(&tunnel);
+        drop(tunnel);
+        *self.handle.write().await = handle;
+        Ok(())
+    }
+
+    pub async fn tunnel_handle(&self) -> TunnelHandle {
+        self.handle.read().await.clone()
+    }
+
+    /// Принудительно закрывает текущий туннель; `serve_datagrams` после этого
+    /// переподключится автоматически.
+    pub async fn force_close(&self) {
+        let handle = self.handle.read().await.clone();
+        handle.close();
     }
 
     pub fn udp_relay(&self) -> Arc<UdpRelay> {
@@ -85,10 +113,29 @@ impl Client {
     }
 
     pub async fn serve_datagrams(self: Arc<Self>) {
+        let mut backoff = Duration::from_millis(500);
         loop {
-            let dg = match self.tunnel.lock().await.recv_datagram().await {
+            let recv = {
+                let mut t = self.tunnel.lock().await;
+                t.recv_datagram().await
+            };
+            let dg = match recv {
                 Ok(d) => d,
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!("tunnel closed ({e}), reconnecting in {}ms", backoff.as_millis());
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    match self.reconnect().await {
+                        Ok(()) => {
+                            backoff = Duration::from_millis(500);
+                            continue;
+                        }
+                        Err(re) => {
+                            tracing::error!("reconnect failed: {re}");
+                            continue;
+                        }
+                    }
+                }
             };
             self.udp.route_reply(dg).await;
         }
@@ -145,7 +192,8 @@ impl Client {
         let req = socks5::read_request(&mut tcp).await?;
         match req.cmd {
             socks5::CMD_CONNECT => {
-                let mut peer_stream = match self.handle.open_stream(&req.address).await {
+                let handle = self.handle.read().await.clone();
+                let mut peer_stream = match handle.open_stream(&req.address).await {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = tcp.write_all(&[5, 0x04, 0, 1, 0, 0, 0, 0, 0, 0]).await;

@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quic,
         ws,
         next_hop,
+        max_conns: file.max_conns.unwrap_or(0),
     };
 
     if config.quic.is_none() && config.ws.is_none() {
@@ -77,6 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let server: Arc<Server> = Server::new(config);
-    server.run().await?;
+    tokio::select! {
+        r = server.run() => r?,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutdown signal received");
+        }
+    }
     Ok(())
 }
