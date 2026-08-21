@@ -74,20 +74,33 @@ handshake этого не любит.
 `4` unsupported, `5` protocol violation (replay), `6` internal.
 
 ### Обфускация
-`Obfuscator` (только WS): `salt(8) || ciphertext(XOR) || tag(16, keyed BLAKE3)`.
-`decrypt` проверяет тег и возвращает `None` при несовпадении. Ключ pre-shared.
-Меняешь формат — обнови тесты `obfuscation.rs`.
+`Obfuscator` (только WS): `salt(8) || body(XOR) || tag(16, keyed BLAKE3)`, где
+`body = XOR(keystream, seq(8 BE) || payload)`, keystream = `BLAKE3(key || salt)`.
+Встроенный монотонный `seq` даёт **packet-level anti-replay**: приёмник держит
+скользящее окно (`ReplayFilter`) и дропает уже виденные/устаревшие `seq`.
+`decrypt_outcome` различает `Ok` / `Replay` (тихий дроп) / `Invalid` (плохой
+тег/мусор → разрыв соединения). Ключ pre-shared. Меняешь формат — обнови
+тесты `obfuscation.rs`.
 
 ### Congestion control
 `hydr-cc::transport_config(rate_bps)`: при `rate>0` подключается brutal-контроллер
 (окно = `rate/8 × RTT`, не режется при потерях). WS этим не управляется (им
-правит TCP).
+правит TCP). **Привязка `hydr-cc` к WS пока не сделана — не критично**: пейсинг
+WS делегируется TCP, а token-bucket-хук на отправку WS-фреймов — возможное
+будущее расширение, не влияющее на корректность.
 
 ### Multi-hop / MUX
 `next_hop` в `ServerConfig` релеит туннель на следующий узел (QUIC или WS).
-**MUX не реализован**: флаг `FEATURE_MUX` удалён из wire-формата; логический
-mux поверх QUIC есть нативно (стримы), поверх WS — `stream_id` фреймов, но
-per-session re-auth пока future work.
+**MUX реализован поверх WS (draft v1.1)**: флаг `FEATURE_MUX` удалён из
+wire-формата; поверх QUIC mux есть нативно (стримы), поверх WS — `stream_id`
+фреймов. Каждый ненулевой `stream_id`, используемый для `OpenStream`/
+`Datagram`, ДОЛЖЕН сначала пройти собственный `AuthRequest`/`AuthResponse` на
+этом `stream_id` (per-session re-auth). Сервер держит таблицу аутентифицированных
+`sid` и отклоняет неавторизованные с `error_code = 0x05`, не разрывая соединение.
+MUX — opt-in: `ws::accept_with_obfuscation(tcp, path, validate, ob, mux)`; при
+`mux = false` (по умолчанию) поведение односессионное, как раньше. Клиент
+аутентифицирует сессию через `WsTunnel::authenticate(sid, &AuthRequest)` и
+открывает поток через `WsTunnel::open_stream_as(sid, &addr)`.
 
 ## Конвенции кода
 - Сообщения кодируются `encode(&mut Vec<u8>)` / декодируются `decode(&[u8]) -> Result<(_, usize)>`

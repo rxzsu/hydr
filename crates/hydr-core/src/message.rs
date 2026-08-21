@@ -523,6 +523,95 @@ mod tests {
         let mut f = || 0u8;
         assert_eq!(random_padding(&mut f, 0).len(), 0);
     }
+
+    // --- Fragmentation edge cases (wire-format level) ---
+    //
+    // Внимание: в текущей реализации поля frag_id/frag_count переносятся
+    // «как есть» — автоматической сборки фрагментов (reassembly) нет; сервер/клиент
+    // шлют каждый UDP-пакет одним Datagram-сообщением. Тесты ниже проверяют
+    // корректность кодирования/декодирования граничных значений фрагментации.
+
+    #[test]
+    fn datagram_single_fragment_default() {
+        let a = Datagram::new(3, Address::Ip("1.2.3.4".parse().unwrap(), 53), vec![9, 8, 7]);
+        assert_eq!(a.frag_count, 1);
+        assert_eq!(a.frag_id, 0);
+        assert_eq!(a.packet_id, 0);
+        let mut buf = Vec::new();
+        a.encode(&mut buf);
+        let (b, _) = Datagram::decode(&buf).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn datagram_fragment_fields_roundtrip() {
+        for (fid, fcount) in [(0u8, 1u8), (0, 5), (4, 5), (1, 255), (254, 255)] {
+            let mut a = Datagram::new(9, Address::Domain("x.io".into(), 80), vec![1, 2]);
+            a.packet_id = 1234;
+            a.frag_id = fid;
+            a.frag_count = fcount;
+            let mut buf = Vec::new();
+            a.encode(&mut buf);
+            let (b, used) = Datagram::decode(&buf).unwrap();
+            assert_eq!(a, b, "fid={fid} fcount={fcount}");
+            assert_eq!(used, buf.len());
+        }
+    }
+
+    #[test]
+    fn datagram_max_frag_count() {
+        let mut a = Datagram::new(1, Address::Ip("127.0.0.1".parse().unwrap(), 1), vec![]);
+        a.frag_count = u8::MAX;
+        a.frag_id = u8::MAX - 1;
+        let mut buf = Vec::new();
+        a.encode(&mut buf);
+        let (b, _) = Datagram::decode(&buf).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn datagram_packet_id_wraps_u16() {
+        let mut a = Datagram::new(5, Address::Domain("a.b".into(), 443), vec![0]);
+        a.packet_id = u16::MAX;
+        let mut buf = Vec::new();
+        a.encode(&mut buf);
+        let (b, _) = Datagram::decode(&buf).unwrap();
+        assert_eq!(b.packet_id, u16::MAX);
+    }
+
+    #[test]
+    fn datagram_zero_length_payload_roundtrip() {
+        let a = Datagram::new(11, Address::Ip("10.0.0.1".parse().unwrap(), 53), vec![]);
+        let mut buf = Vec::new();
+        a.encode(&mut buf);
+        let (b, used) = Datagram::decode(&buf).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(used, buf.len());
+        assert!(b.payload.is_empty());
+    }
+
+    #[test]
+    fn datagram_fragments_are_independent_messages() {
+        // каждый фрагмент — отдельное Datagram-сообщение; поля должны
+        // сохраняться независимо для каждого из них
+        let mut f0 = Datagram::new(7, Address::Ip("8.8.8.8".parse().unwrap(), 53), b"part0".to_vec());
+        f0.packet_id = 42;
+        f0.frag_id = 0;
+        f0.frag_count = 3;
+        let mut f1 = f0.clone();
+        f1.frag_id = 1;
+        f1.payload = b"part1".to_vec();
+        let mut b0 = Vec::new();
+        f0.encode(&mut b0);
+        let mut b1 = Vec::new();
+        f1.encode(&mut b1);
+        let (d0, _) = Datagram::decode(&b0).unwrap();
+        let (d1, _) = Datagram::decode(&b1).unwrap();
+        assert_eq!(d0.packet_id, d1.packet_id);
+        assert_eq!(d0.frag_count, d1.frag_count);
+        assert_ne!(d0.frag_id, d1.frag_id);
+        assert_ne!(d0.payload, d1.payload);
+    }
 }
 
 #[cfg(test)]

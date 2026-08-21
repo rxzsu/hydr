@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_util::{SinkExt, StreamExt};
@@ -9,8 +9,8 @@ use hydr_core::frame::{
     Frame, FRAME_AUTH_REQUEST, FRAME_AUTH_RESPONSE, FRAME_DATAGRAM, FRAME_OPEN_STREAM,
     FRAME_OPEN_STREAM_ACK, FRAME_PING, FRAME_PONG, FRAME_STREAM_CLOSE, FRAME_STREAM_DATA,
 };
-use hydr_core::message::{AuthRequest, AuthResponse, Datagram, OpenStream, OpenStreamAck, STATUS_OK};
-use hydr_core::obfuscation::Obfuscator;
+use hydr_core::message::{AuthRequest, AuthResponse, Datagram, OpenStream, OpenStreamAck, ERR_PROTOCOL, STATUS_ERR, STATUS_OK};
+use hydr_core::obfuscation::{DecryptOutcome, Obfuscator};
 use hydr_core::{Address, Error, Result};
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf,
@@ -52,6 +52,26 @@ impl WsHandle {
         Ok(Box::new(DuplexIo { r: b_read, w: b_write }))
     }
 
+    /// MUX: как `open_stream`, но с явным `id` сессии (без инкремента счётчика).
+    pub async fn open_stream_with_id(&self, id: u64, addr: &Address) -> Result<DynStream> {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (b_read, b_write) = tokio::io::split(b);
+        let (a_read, a_write) = tokio::io::split(a);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::Open {
+                id,
+                addr: addr.clone(),
+                a_read,
+                a_write,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| Error::StreamClosed)?;
+        ack_rx.await.map_err(|_| Error::StreamClosed)??;
+        Ok(Box::new(DuplexIo { r: b_read, w: b_write }))
+    }
+
     pub fn send_datagram(&self, dg: &Datagram) -> Result<()> {
         let mut body = Vec::new();
         dg.encode(&mut body);
@@ -69,6 +89,8 @@ impl WsHandle {
 pub struct WsTunnel {
     pub(crate) handle: WsHandle,
     event_rx: mpsc::Receiver<WsEvent>,
+    /// Ожидающие ответы на per-session `AuthRequest` (MUX), по stream_id.
+    pending_auth: PendingAuthMap,
 }
 
 pub enum WsEvent {
@@ -112,13 +134,18 @@ struct PendingOpen {
 }
 
 impl WsTunnel {
-    fn new(cmd: mpsc::Sender<Cmd>, event_rx: mpsc::Receiver<WsEvent>) -> Self {
+    fn new(
+        cmd: mpsc::Sender<Cmd>,
+        event_rx: mpsc::Receiver<WsEvent>,
+        pending_auth: PendingAuthMap,
+    ) -> Self {
         Self {
             handle: WsHandle {
                 cmd: cmd.clone(),
                 next_stream_id: Arc::new(AtomicU64::new(0)),
             },
             event_rx,
+            pending_auth,
         }
     }
 
@@ -128,6 +155,27 @@ impl WsTunnel {
 
     pub async fn open_stream(&self, addr: &Address) -> Result<DynStream> {
         self.handle.open_stream(addr).await
+    }
+
+    /// MUX: открыть поток в рамках явно заданной сессии (`session_id`).
+    /// Перед этим сессия должна быть аутентифицирована через `authenticate`.
+    pub async fn open_stream_as(&self, session_id: u64, addr: &Address) -> Result<DynStream> {
+        self.handle.open_stream_with_id(session_id, addr).await
+    }
+
+    /// MUX: выполнить per-session аутентификацию (re-auth) в рамках сессии
+    /// `session_id`. Сервер должен ответить `AuthResponse` на тот же stream_id.
+    pub async fn authenticate(&self, session_id: u64, auth: &AuthRequest) -> Result<AuthResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_auth.lock().unwrap().insert(session_id, tx);
+        let mut body = Vec::new();
+        auth.encode(&mut body);
+        self.handle
+            .cmd
+            .send(Cmd::SendFrame(Frame::new(session_id, FRAME_AUTH_REQUEST, body)))
+            .await
+            .map_err(|_| Error::StreamClosed)?;
+        rx.await.map_err(|_| Error::StreamClosed)?
     }
 
     pub fn send_datagram(&self, dg: &Datagram) -> Result<()> {
@@ -220,10 +268,24 @@ fn outbound(f: &Frame, ob: &Option<Arc<Obfuscator>>) -> Message {
     Message::Binary(Bytes::from(b))
 }
 
-fn inbound(bytes: &[u8], ob: &Option<Arc<Obfuscator>>) -> Vec<u8> {
+/// Результат приёма WS-кадра: кадр для обработки, тихий дроп (replay) или
+/// разрыв соединения (невалидный MAC / мусор).
+enum Inbound {
+    Frame(Vec<u8>),
+    Drop,
+    Close,
+}
+
+fn inbound(bytes: &[u8], ob: &Option<Arc<Obfuscator>>) -> Inbound {
     match ob {
-        Some(ob) => ob.decrypt(bytes).unwrap_or_default(),
-        None => bytes.to_vec(),
+        Some(ob) => match ob.decrypt_outcome(bytes) {
+            DecryptOutcome::Ok(v) => Inbound::Frame(v),
+            // корректный MAC, но уже виденный seq — тихо дропаем (anti-replay)
+            DecryptOutcome::Replay => Inbound::Drop,
+            // плохой тег / обрезка / мусор — соединение бесполезно, рвём
+            DecryptOutcome::Invalid => Inbound::Close,
+        },
+        None => Inbound::Frame(bytes.to_vec()),
     }
 }
 
@@ -247,6 +309,12 @@ async fn pump_stream(cmd_tx: mpsc::Sender<Cmd>, id: u64, mut a_read: WsRead) {
 }
 
 type ServerValidator = Arc<dyn Fn(&AuthRequest) -> Result<AuthResponse> + Send + Sync>;
+
+/// Таблица аутентифицированных MUX-сессий (по `stream_id`).
+type SessionTable = Arc<Mutex<HashSet<u64>>>;
+
+/// Ожидающие ответы на per-session `AuthResponse`, по `stream_id`.
+type PendingAuthMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<AuthResponse>>>>>;
 
 pub(crate) async fn reply_open(
     cmd: &mpsc::Sender<Cmd>,
@@ -297,13 +365,17 @@ pub async fn connect_with_obfuscation(
     let (event_tx, event_rx) = mpsc::channel(1024);
     let (auth_tx, auth_rx) = oneshot::channel();
 
-    let tunnel = WsTunnel::new(cmd_tx.clone(), event_rx);
+    let pending_auth = Arc::new(Mutex::new(HashMap::new()));
+    let tunnel = WsTunnel::new(cmd_tx.clone(), event_rx, pending_auth.clone());
     tokio::spawn(run(
         ws,
         cmd_rx,
         event_tx,
         Some(auth_tx),
         None,
+        None,
+        None,
+        Some(pending_auth),
         cmd_tx.clone(),
         obfuscation,
     ));
@@ -331,7 +403,7 @@ pub async fn accept(
     path: &str,
     validate: ServerValidator,
 ) -> Result<(WsTunnel, AuthRequest)> {
-    accept_with_obfuscation(tcp, path, validate, None).await
+    accept_with_obfuscation(tcp, path, validate, None, false).await
 }
 
 pub async fn accept_with_obfuscation(
@@ -339,6 +411,7 @@ pub async fn accept_with_obfuscation(
     path: &str,
     validate: ServerValidator,
     obfuscation: Option<Arc<Obfuscator>>,
+    mux: bool,
 ) -> Result<(WsTunnel, AuthRequest)> {
     let ws = tokio_tungstenite::accept_hdr_async(
         tcp,
@@ -361,13 +434,25 @@ pub async fn accept_with_obfuscation(
     let (event_tx, event_rx) = mpsc::channel(1024);
     let (auth_tx, auth_rx) = oneshot::channel();
 
-    let tunnel = WsTunnel::new(cmd_tx.clone(), event_rx);
+    let pending_auth = Arc::new(Mutex::new(HashMap::new()));
+    // При mux=false сессии не отслеживаются → per-session принуждение выключено
+    // (совместимость с односессионным режимом). При mux=true каждый stream_id
+    // должен быть аутентифицирован отдельно (настоящий MUX).
+    let sessions = if mux {
+        Some(Arc::new(Mutex::new(HashSet::new())))
+    } else {
+        None
+    };
+    let tunnel = WsTunnel::new(cmd_tx.clone(), event_rx, pending_auth.clone());
     tokio::spawn(run(
         ws,
         cmd_rx,
         event_tx,
         None,
-        Some((validate, auth_tx)),
+        Some(validate),
+        sessions,
+        Some(auth_tx),
+        None,
         cmd_tx.clone(),
         obfuscation,
     ));
@@ -376,12 +461,16 @@ pub async fn accept_with_obfuscation(
     Ok((tunnel, req))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     ws: WebSocketStream<S>,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     event_tx: mpsc::Sender<WsEvent>,
     mut auth_response: Option<oneshot::Sender<Result<AuthResponse>>>,
-    mut server_auth: Option<(ServerValidator, oneshot::Sender<Result<AuthRequest>>)>,
+    auth: Option<ServerValidator>,
+    sessions: Option<SessionTable>,
+    mut server_auth_done: Option<oneshot::Sender<Result<AuthRequest>>>,
+    pending_auth: Option<PendingAuthMap>,
     cmd_tx: mpsc::Sender<Cmd>,
     obfuscation: Option<Arc<Obfuscator>>,
 ) {
@@ -442,9 +531,16 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
             Some(msg) = stream.next() => {
                 match msg {
                     Ok(Message::Binary(bytes)) => {
-                        let bytes = inbound(&bytes, &obfuscation);
-                        if handle_frame(&mut sink, &bytes, &mut streams, &mut pending, &mut auth_response, &mut server_auth, &event_tx, &cmd_tx, &obfuscation).await.is_err() {
-                            break;
+                        match inbound(&bytes, &obfuscation) {
+                            Inbound::Frame(bytes) => {
+                                if handle_frame(&mut sink, &bytes, &mut streams, &mut pending, &mut auth_response, &auth, &sessions, &mut server_auth_done, &pending_auth, &event_tx, &cmd_tx, &obfuscation).await.is_err() {
+                                    break;
+                                }
+                            }
+                            // replay (корректный MAC, старый seq) — тихо дропаем
+                            Inbound::Drop => {}
+                            // невалидный MAC / мусор — рвём соединение
+                            Inbound::Close => break,
                         }
                     }
                     Ok(Message::Ping(payload)) => {
@@ -475,7 +571,10 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
     streams: &mut HashMap<u64, WsWrite>,
     pending: &mut HashMap<u64, PendingOpen>,
     auth_response: &mut Option<oneshot::Sender<Result<AuthResponse>>>,
-    server_auth: &mut Option<(ServerValidator, oneshot::Sender<Result<AuthRequest>>)>,
+    auth: &Option<ServerValidator>,
+    sessions: &Option<SessionTable>,
+    server_auth_done: &mut Option<oneshot::Sender<Result<AuthRequest>>>,
+    pending_auth: &Option<PendingAuthMap>,
     event_tx: &mpsc::Sender<WsEvent>,
     cmd_tx: &mpsc::Sender<Cmd>,
     obfuscation: &Option<Arc<Obfuscator>>,
@@ -483,30 +582,71 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
     let (frame, _) = Frame::decode(bytes)?;
     match frame.frame_type {
         FRAME_AUTH_REQUEST => {
-            if let Some((validate, done)) = server_auth.take() {
+            if let Some(validate) = auth {
                 let resp = AuthRequest::decode(&frame.body)
                     .map(|(req, _)| {
                         let resp = validate(&req);
-                        let _ = done.send(Ok(req));
+                        if frame.stream_id == 0 {
+                            // control-сессия (исходный хендшейк): один раз
+                            // доставляем запрос вызывающему
+                            if let Some(done) = server_auth_done.take() {
+                                let _ = done.send(Ok(req));
+                            }
+                        } else if let Some(sessions) = sessions {
+                            // per-session re-auth (MUX): регистрируем сессию
+                            // только при успешной аутентификации
+                            if let Ok(r) = &resp
+                                && r.status == STATUS_OK
+                            {
+                                sessions.lock().unwrap().insert(frame.stream_id);
+                            }
+                        }
                         resp
                     })
                     .unwrap_or_else(|_| Ok(AuthResponse::error("bad request")));
                 let resp = resp.unwrap_or_else(|e| AuthResponse::error(&e.to_string()));
                 let mut body = Vec::new();
                 resp.encode(&mut body);
-                let f = Frame::new(0, FRAME_AUTH_RESPONSE, body);
+                // ответ шлем на тот же stream_id (0 = control, sid = session)
+                let f = Frame::new(frame.stream_id, FRAME_AUTH_RESPONSE, body);
                 sink.send(outbound(&f, obfuscation))
                     .await
                     .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
             }
         }
         FRAME_AUTH_RESPONSE => {
-            if let Some(tx) = auth_response.take() {
+            if frame.stream_id == 0
+                && let Some(tx) = auth_response.take()
+            {
+                let resp = AuthResponse::decode(&frame.body).map(|(r, _)| r);
+                let _ = tx.send(resp);
+            } else if let Some(pa) = pending_auth
+                && let Some(tx) = pa.lock().unwrap().remove(&frame.stream_id)
+            {
                 let resp = AuthResponse::decode(&frame.body).map(|(r, _)| r);
                 let _ = tx.send(resp);
             }
         }
         FRAME_OPEN_STREAM => {
+            // MUX: открытие потока в неавторизованной сессии (sid != 0)
+            // отклоняется с кодом ERR_PROTOCOL, но соединение не разрывается.
+            if frame.stream_id != 0
+                && let Some(sessions) = sessions
+                && !sessions.lock().unwrap().contains(&frame.stream_id)
+            {
+                let ack = OpenStreamAck {
+                    status: STATUS_ERR,
+                    error_code: ERR_PROTOCOL,
+                    message: b"session not authenticated".to_vec(),
+                };
+                let mut body = Vec::new();
+                ack.encode(&mut body);
+                let f = Frame::new(frame.stream_id, FRAME_OPEN_STREAM_ACK, body);
+                sink.send(outbound(&f, obfuscation))
+                    .await
+                    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                return Ok(());
+            }
             if let Ok((req, _)) = OpenStream::decode(&frame.body) {
                 let (a, b) = tokio::io::duplex(64 * 1024);
                 let (a_read, a_write) = tokio::io::split(a);
@@ -554,6 +694,13 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         FRAME_DATAGRAM => {
+            // MUX: датаграммы вне авторизованной сессии отбрасываются
+            if frame.stream_id != 0
+                && let Some(sessions) = sessions
+                && !sessions.lock().unwrap().contains(&frame.stream_id)
+            {
+                return Ok(());
+            }
             if let Ok((dg, _)) = Datagram::decode(&frame.body) {
                 let _ = event_tx.send(WsEvent::Datagram(dg)).await;
             }

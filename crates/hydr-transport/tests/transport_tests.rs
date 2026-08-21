@@ -212,7 +212,7 @@ async fn spawn_ws_obfuscated(key: Arc<hydr_core::obfuscation::Obfuscator>) -> So
             let val = validator();
             let key = key.clone();
             tokio::spawn(async move {
-                let (tunnel, _req) = match ws::accept_with_obfuscation(tcp, "/hydr", val, Some(key)).await {
+                let (tunnel, _req) = match ws::accept_with_obfuscation(tcp, "/hydr", val, Some(key), false).await {
                     Ok(v) => v,
                     Err(_) => return,
                 };
@@ -362,4 +362,85 @@ async fn ws_many_concurrent_streams() {
             .expect("stream timeout")
             .expect("stream ok");
     }
+}
+
+fn test_auth_pw(pw: &[u8]) -> AuthRequest {
+    AuthRequest::new_password(pw, 0, FEATURE_UDP)
+}
+
+fn mux_validator() -> Validator {
+    // принимает два разных пароля — для демонстрации per-session re-auth
+    Arc::new(|req: &AuthRequest| {
+        let ok = [b"pw-a".as_ref(), b"pw-b".as_ref()].iter().any(|pw| {
+            let expected = hydr_core::message::compute_auth_proof(pw, &req.client_nonce);
+            hydr_core::message::ct_eq(&expected, &req.auth_proof)
+        });
+        if ok {
+            Ok(AuthResponse::ok(0, FEATURE_UDP))
+        } else {
+            Ok(AuthResponse::error("bad password"))
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_mux_per_session_auth() {
+    hydr_transport::tls::install_default_provider();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let val = mux_validator();
+            tokio::spawn(async move {
+                let (tunnel, _req) = match ws::accept_with_obfuscation(tcp, "/hydr", val, None, true).await
+                {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut t: Tunnel = Tunnel::Ws(tunnel);
+                echo_loop(&mut t).await;
+            });
+        }
+    });
+
+    let url = format!("ws://{local}/hydr");
+    // control-сессия (stream_id 0) аутентифицируется паролем pw-a
+    let client = ws::connect(&url, true, &test_auth_pw(b"pw-a")).await.unwrap();
+
+    // per-session re-auth сессии 5 паролем pw-b — успех
+    let resp = client
+        .authenticate(5, &test_auth_pw(b"pw-b"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, STATUS_OK, "per-session auth должен пройти");
+
+    // открываем поток внутри аутентифицированной сессии 5 — эхо работает
+    let mut s = client
+        .open_stream_as(5, &Address::Ip("127.0.0.1".parse().unwrap(), 9))
+        .await
+        .unwrap();
+    s.write_all(b"hello-mux").await.unwrap();
+    s.shutdown().await.unwrap();
+    let mut buf = [0u8; 9];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello-mux");
+
+    // неверный пароль для сессии 7 — отклоняется
+    let resp2 = client
+        .authenticate(7, &test_auth_pw(b"nope"))
+        .await
+        .unwrap();
+    assert_ne!(resp2.status, STATUS_OK, "плохой пароль должен быть отклонён");
+
+    // открытие потока в неавторизованной сессии 7 — ошибка ERR_PROTOCOL
+    let r = client
+        .open_stream_as(7, &Address::Ip("127.0.0.1".parse().unwrap(), 9))
+        .await;
+    assert!(r.is_err(), "неавторизованная сессия не должна открываться");
 }

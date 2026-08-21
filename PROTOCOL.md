@@ -5,7 +5,7 @@
 censorship resistance. It runs over two interchangeable transports:
 **QUIC** and **WebSocket**, exposing a common message layer on top.
 
-> Status: **draft v1**. Implemented in `crates/hydr-core`.
+> Status: **draft v1.1**. Implemented in `crates/hydr-core`.
 
 ## Requirements Language
 
@@ -56,7 +56,17 @@ random `client_nonce` and proves knowledge of the password by sending
 server recomputes the value from its own password and the received nonce and
 compares it in constant time. Because `auth_proof` is bound to the nonce, a
 captured handshake cannot be replayed: the server remembers recently seen
-nonces and rejects duplicates.
+nonces (bounded cache) and rejects duplicates with `error_code = 0x05`.
+
+The control channel (stream id `0`) authenticates the whole tunnel. On the
+**WebSocket transport** an authenticated tunnel MAY carry multiple logical
+sessions, each identified by a distinct `stream_id`. Every non-zero `stream_id`
+used for `OpenStream`/`Datagram` MUST first be authenticated with its own
+`AuthRequest`/`AuthResponse` exchange on that `stream_id` (per-session
+re-auth / MUX). The server tracks the set of authenticated `stream_id`s and
+rejects unauthenticated ones with `error_code = 0x05`. The QUIC transport does
+not need this: each QUIC connection already authenticates once, and QUIC
+streams are native to that single authenticated connection.
 
 ```
 AuthRequest:
@@ -172,13 +182,22 @@ dispatched to the stream matching `stream_id`.
 
 ## Session Multiplexing (MUX)
 
-> **Status (draft v1.1):** not implemented. The `FEATURE_MUX` flag was removed
-> from the wire format; currently each transport connection carries a single
-> authenticated tunnel. Logical multiplexing over QUIC is already provided
-> natively by QUIC streams, and over WS by the frame `stream_id`. True
-> per-session re-authentication (each logical session performing its own
-> `AuthRequest`/`AuthResponse` exchange) remains future work and is the
-> foundation for multi-hop chains with distinct credentials per hop.
+> **Status (draft v1.1):** implemented on the WebSocket transport.
+
+The `FEATURE_MUX` flag was removed from the wire format. Each QUIC connection
+authenticates once and multiplexes natively via QUIC streams. On the WebSocket
+transport, logical multiplexing was already provided by the frame `stream_id`;
+**draft v1.1 adds true per-session re-authentication**: any non-zero `stream_id`
+used for `OpenStream`/`Datagram` MUST first perform its own `AuthRequest`/
+`AuthResponse` exchange on that `stream_id`. The server maintains a table of
+authenticated `stream_id`s and rejects unauthenticated sessions with
+`error_code = 0x05` (the connection itself stays open). This is the foundation
+for multi-hop chains where each hop may present distinct credentials.
+
+MUX is opt-in on the server: `accept_with_obfuscation(..., mux = true)` enables
+per-session enforcement; with `mux = false` (default, single-session usage) the
+legacy behaviour is preserved and non-zero `stream_id`s are allowed without
+re-auth.
 
 ## Multi-hop / Chaining
 
@@ -204,6 +223,12 @@ packet loss (in contrast to NewReno/CUBIC). Each side applies its own
 configured `cc_rx` to its sending direction. The WS transport has no
 congestion control (TCP governs the flow).
 
+> **Note (draft v1.1):** `hydr-cc` is wired into the QUIC transport only. The
+> WebSocket transport does not currently apply the brutal-style rate limiter;
+> pacing there is delegated to the underlying TCP. A token-bucket hook on WS
+> frame send is a candidate future extension but is **not** required for
+> correctness and is intentionally left out for now.
+
 ## Obfuscation
 
 An optional XOR obfuscation layer ("Salamander-style") MAY wrap every
@@ -211,16 +236,24 @@ transport datagram/byte:
 
 ```
 [8 bytes]  salt
-[bytes]    ciphertext  (ciphertext[i] ^= BLAKE3(key || salt)[i % 32])
-[16 bytes] tag         (keyed_hash(key32, ciphertext), first 16 bytes)
+[bytes]    body   (XOR(keystream, [8-byte seq BE] || payload), keystream = BLAKE3(key || salt))
+[16 bytes] tag    (keyed_hash(key32, body), first 16 bytes)
 ```
 
+The plaintext embedded in `body` is `seq (8 bytes, big-endian) || payload`. The
+sender attaches a monotonically increasing `seq` to every message; the receiver
+keeps a **sliding-window replay filter** over `seq` and drops any message whose
+`seq` has already been seen or falls outside the window. A captured-and-replayed
+WS frame therefore fails replay detection and is silently discarded (without
+tearing down the connection), while a tampered or wrong-key frame fails the MAC
+and closes the connection.
+
 Without the pre-shared obfuscation key the stream is indistinguishable from
-random bytes. The trailing `tag` is a keyed BLAKE3 MAC over the ciphertext, so
-a peer holding the wrong key (or a tampered message) fails verification and the
-frame is discarded. This gives the obfuscation layer integrity and
-authentication on top of its scrambling, protecting datagrams carried over WS
-(which otherwise have no per-message authentication of their own).
+random bytes. The trailing `tag` is a keyed BLAKE3 MAC over `body`, so a peer
+holding the wrong key (or a tampered message) fails verification. This gives the
+obfuscation layer integrity, authentication and packet-level anti-replay on top
+of its scrambling, protecting datagrams carried over WS (which otherwise have
+no per-message authentication of their own).
 
 The layer is configured per-endpoint with a pre-shared key. In the WS
 transport it is applied per WebSocket binary message: the frame bytes are

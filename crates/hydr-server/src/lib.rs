@@ -307,7 +307,7 @@ impl Server {
                     let s = server.clone();
                     Arc::new(move |r: &AuthRequest| s.validate(r))
                 };
-                let handshake = ws::accept_with_obfuscation(tcp, &path, val, ob);
+                let handshake = ws::accept_with_obfuscation(tcp, &path, val, ob, false);
                 let (tunnel, _req) =
                     match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, handshake).await {
                         Ok(Ok(v)) => v,
