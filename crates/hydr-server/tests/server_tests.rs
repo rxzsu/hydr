@@ -2,8 +2,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hydr_core::message::{AuthRequest, Datagram, FEATURE_UDP};
+use hydr_core::message::{
+    compute_auth_proof, AuthRequest, Datagram, FEATURE_UDP, NONCE_LEN, PROTOCOL_VERSION,
+};
+use hydr_core::obfuscation::Obfuscator;
 use hydr_core::Address;
+use hydr_server::WsListen;
 use hydr_transport::{quic, ws, QuicTunnel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -174,6 +178,62 @@ async fn auth_failure_rejected() {
     assert!(got_err, "bad password must be rejected");
 }
 
+/// Строит запрос с фиксированным nonce (для проверки защиты от replay).
+fn fixed_auth(nonce: &[u8; NONCE_LEN], password: &[u8], features: u8) -> AuthRequest {
+    AuthRequest {
+        version: PROTOCOL_VERSION,
+        auth_method: AuthRequest::AUTH_PASSWORD,
+        client_nonce: nonce.to_vec(),
+        auth_proof: compute_auth_proof(password, nonce),
+        cc_rx: 0,
+        features,
+        padding: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_detected_on_second_auth_quic() {
+    let (_server, quic_addr) = spawn_quic(base_config()).await;
+    let nonce = [0xABu8; NONCE_LEN];
+    let req = fixed_auth(&nonce, PASSWORD.as_bytes(), FEATURE_UDP);
+    assert!(
+        quic::connect(quic_addr, "localhost", true, None, &req).await.is_ok(),
+        "первый коннект с nonce должен пройти"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut rejected = false;
+    while Instant::now() < deadline {
+        if quic::connect(quic_addr, "localhost", true, None, &req).await.is_err() {
+            rejected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(rejected, "replay того же nonce должен отклоняться");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_detected_on_second_auth_ws() {
+    let (server, url) = spawn_ws(base_config()).await;
+    let nonce = [0xCDu8; NONCE_LEN];
+    let req = fixed_auth(&nonce, PASSWORD.as_bytes(), FEATURE_UDP);
+    assert!(
+        ws::connect(&url, true, &req).await.is_ok(),
+        "первый коннект с nonce должен пройти"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut rejected = false;
+    while Instant::now() < deadline {
+        if ws::connect(&url, true, &req).await.is_err() {
+            rejected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(rejected, "replay того же nonce должен отклоняться");
+    drop(server);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn many_concurrent_streams_one_tunnel() {
     let (echo, _eh) = echo_tcp().await;
@@ -242,4 +302,93 @@ async fn multi_hop_ws() {
     let (_front, url) = spawn_ws(front_cfg).await;
     let mut t = hydr_transport::Tunnel::Ws(connect_ws(&url).await);
     echo_via_tunnel(&mut t, echo, "multi-hop-ws-tcp").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_auth_failure_rejected() {
+    let (server, url) = spawn_ws(base_config()).await;
+    let bad = AuthRequest::new_password(b"wrong", 0, FEATURE_UDP);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut got_err = false;
+    while Instant::now() < deadline {
+        if ws::connect(&url, true, &bad).await.is_err() {
+            got_err = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(got_err, "ws: bad password must be rejected");
+    drop(server);
+}
+
+async fn spawn_ws_full(
+    path: &str,
+    obf: Option<&str>,
+) -> (Arc<Server>, String) {
+    let l = Server::make_ws_listener("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = l.local_addr().unwrap();
+    let mut cfg = base_config();
+    cfg.ws = Some(WsListen {
+        bind: addr,
+        path: path.into(),
+        obfuscation: obf.map(str::to_string),
+    });
+    let server = Server::new(cfg);
+    let obf_opt = obf.map(str::to_string);
+    tokio::spawn(server.clone().run_ws_listener(l, path.into(), obf_opt));
+    (server, format!("ws://{addr}{path}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_obfuscated_tcp_stream() {
+    let (echo, _eh) = echo_tcp().await;
+    let (server, url) = spawn_ws_full("/hydr", Some("obf-key")).await;
+    let key = Arc::new(Obfuscator::new(b"obf-key"));
+    let tunnel = ws::connect_with_obfuscation(&url, true, &auth(), Some(key))
+        .await
+        .expect("obfuscated ws connect");
+    let mut t = hydr_transport::Tunnel::Ws(tunnel);
+    echo_via_tunnel(&mut t, echo, "ws-obf-tcp").await;
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_obfuscation_key_mismatch_rejected() {
+    let (_server, url) = spawn_ws_full("/hydr", Some("server-key")).await;
+    let client_key = Arc::new(Obfuscator::new(b"client-key"));
+    let res = ws::connect_with_obfuscation(&url, true, &auth(), Some(client_key)).await;
+    assert!(res.is_err(), "ws: mismatched obfuscation keys must fail");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_connect_refused_returns_error() {
+    let (_server, quic_addr) = spawn_quic(base_config()).await;
+    let t = hydr_transport::Tunnel::Quic(connect_quic(quic_addr).await);
+    let handle = hydr_transport::TunnelHandle::from_tunnel(&t);
+    // порт 1 на loopback гарантированно закрыт
+    let target = Address::Ip("127.0.0.1".parse().unwrap(), 1);
+    let res = handle.open_stream(&target).await;
+    assert!(res.is_err(), "connection to closed port must be refused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_conns_rejects_extra_tunnels() {
+    let mut cfg = base_config();
+    cfg.max_conns = 1;
+    let (server, quic_addr) = spawn_quic(cfg).await;
+    // первый туннель занимает единственный слот
+    let _first = connect_quic(quic_addr).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut rejected = false;
+    while Instant::now() < deadline {
+        if quic::connect(quic_addr, "localhost", true, None, &auth()).await.is_err() {
+            rejected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(rejected, "второй туннель при max_conns=1 должен быть отклонён");
+    drop(server);
 }

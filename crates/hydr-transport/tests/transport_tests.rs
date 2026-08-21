@@ -16,7 +16,8 @@ type Validator = Arc<dyn Fn(&AuthRequest) -> hydr_core::Result<AuthResponse> + S
 
 fn validator() -> Validator {
     Arc::new(|req: &AuthRequest| {
-        if req.auth == b"test-password" {
+        let expected = hydr_core::message::compute_auth_proof(b"test-password", &req.client_nonce);
+        if hydr_core::message::ct_eq(&expected, &req.auth_proof) {
             Ok(AuthResponse::ok(0, FEATURE_UDP))
         } else {
             Ok(AuthResponse::error("bad password"))
@@ -249,4 +250,116 @@ async fn ws_obfuscation_key_mismatch_rejected() {
     let client_key = Arc::new(hydr_core::obfuscation::Obfuscator::new(b"client-key"));
     let res = ws::connect_with_obfuscation(&url, false, &test_auth(), Some(client_key)).await;
     assert!(res.is_err(), "mismatched obfuscation keys must fail");
+}
+
+async fn quic_tunnel() -> hydr_transport::Tunnel {
+    hydr_transport::tls::install_default_provider();
+    let addr = spawn_quic_server().await;
+    hydr_transport::Tunnel::Quic(
+        quic::connect(addr, "localhost", true, Some(quic::default_transport_config()), &test_auth())
+            .await
+            .unwrap(),
+    )
+}
+
+async fn ws_tunnel() -> hydr_transport::Tunnel {
+    let addr = spawn_ws_server().await;
+    let url = format!("ws://{addr}/hydr");
+    hydr_transport::Tunnel::Ws(ws::connect(&url, false, &test_auth()).await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_large_datagram() {
+    let mut t = quic_tunnel().await;
+    // QUIC-датаграммы ограничены MTU пути (~1200 байт), берём заведомо влезающее
+    let payload = vec![0xABu8; 1024];
+    let dg = Datagram::new(1, Address::Ip("8.8.8.8".parse().unwrap(), 53), payload.clone());
+    t.send_datagram(&dg).unwrap();
+    let echo = tokio::time::timeout(Duration::from_secs(5), t.recv_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo.payload, payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_large_datagram() {
+    let mut t = ws_tunnel().await;
+    let payload = vec![0xABu8; 4096];
+    let dg = Datagram::new(1, Address::Ip("8.8.8.8".parse().unwrap(), 53), payload.clone());
+    t.send_datagram(&dg).unwrap();
+    let echo = tokio::time::timeout(Duration::from_secs(5), t.recv_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo.payload, payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_multiple_datagrams() {
+    let mut t = quic_tunnel().await;
+    let count = 20u32;
+    for i in 0..count {
+        let payload = format!("pkt-{i}").into_bytes();
+        let dg = Datagram::new(i, Address::Ip("1.1.1.1".parse().unwrap(), 53), payload);
+        t.send_datagram(&dg).unwrap();
+    }
+    let mut got = std::collections::HashSet::new();
+    for _ in 0..count {
+        let echo = tokio::time::timeout(Duration::from_secs(5), t.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        got.insert(echo.session_id);
+    }
+    assert_eq!(got.len() as u32, count, "все датаграммы должны вернуться");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_multiple_datagrams() {
+    let mut t = ws_tunnel().await;
+    let count = 20u32;
+    for i in 0..count {
+        let payload = format!("pkt-{i}").into_bytes();
+        let dg = Datagram::new(i, Address::Ip("1.1.1.1".parse().unwrap(), 53), payload);
+        t.send_datagram(&dg).unwrap();
+    }
+    let mut got = std::collections::HashSet::new();
+    for _ in 0..count {
+        let echo = tokio::time::timeout(Duration::from_secs(5), t.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        got.insert(echo.session_id);
+    }
+    assert_eq!(got.len() as u32, count, "все датаграммы должны вернуться");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_many_concurrent_streams() {
+    let t = ws_tunnel().await;
+    let handle = hydr_transport::TunnelHandle::from_tunnel(&t);
+    let addr = Address::Domain("echo.test".into(), 80);
+
+    let mut handles = Vec::new();
+    for i in 0..20u32 {
+        let h = handle.clone();
+        let addr = addr.clone();
+        handles.push(tokio::spawn(async move {
+            let mut s = h.open_stream(&addr).await.unwrap();
+            let payload = format!("msg-{i}");
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            s.write_all(payload.as_bytes()).await.unwrap();
+            s.shutdown().await.unwrap();
+            let mut buf = vec![0u8; payload.len()];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, payload.as_bytes(), "stream {i}");
+        }));
+    }
+    for h in handles {
+        tokio::time::timeout(Duration::from_secs(15), h)
+            .await
+            .expect("stream timeout")
+            .expect("stream ok");
+    }
 }

@@ -51,9 +51,11 @@ impl QuicTunnel {
 
         let ack = read_message(&mut recv, OpenStreamAck::decode).await?;
         if ack.status == STATUS_ERR {
-            return Err(Error::Message(
-                String::from_utf8_lossy(&ack.message).to_string(),
-            ));
+            return Err(Error::Message(format!(
+                "[code {}] {}",
+                ack.error_code,
+                String::from_utf8_lossy(&ack.message)
+            )));
         }
         Ok(Box::new(QuicStream { send, recv }))
     }
@@ -94,10 +96,11 @@ pub struct QuicAccepted {
 }
 
 impl QuicAccepted {
-    pub async fn ack(&mut self, status: u8, message: &[u8]) -> Result<()> {
+    pub async fn ack(&mut self, status: u8, error_code: u8, message: &[u8]) -> Result<()> {
         let mut buf = Vec::new();
         OpenStreamAck {
             status,
+            error_code,
             message: message.to_vec(),
         }
         .encode(&mut buf);

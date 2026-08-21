@@ -1,10 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hydr_core::message::{AuthRequest, AuthResponse, Datagram, FEATURE_UDP, STATUS_ERR, STATUS_OK};
+use hydr_core::message::{
+    compute_auth_proof, ct_eq, AuthRequest, AuthResponse, Datagram, ERR_BAD_CREDENTIALS,
+    ERR_CONNECT_FAILED, ERR_PROTOCOL, ERR_UNSUPPORTED, FEATURE_UDP, PROTOCOL_VERSION, STATUS_ERR,
+    STATUS_OK,
+};
 use hydr_transport::{quic, ws, DynStream, ServerEvent, Tunnel, TunnelHandle};
 use tokio::sync::Mutex;
 
@@ -68,8 +72,13 @@ pub struct Server {
     udp: Arc<UdpManager>,
     conn_permits: Arc<tokio::sync::Semaphore>,
     auth_attempts: std::sync::Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    /// Кэш использованных client_nonce для защиты от replay атак.
+    replay_nonces: std::sync::Mutex<HashSet<Vec<u8>>>,
     conns_active: AtomicU64,
 }
+
+/// Максимальный размер кэша nonce; при превышении кэш сбрасывается.
+const REPLAY_CACHE_MAX: usize = 8192;
 
 impl Server {
     pub fn new(config: ServerConfig) -> Arc<Self> {
@@ -84,16 +93,52 @@ impl Server {
             udp: UdpManager::new(),
             conn_permits: Arc::new(tokio::sync::Semaphore::new(max_conns)),
             auth_attempts: std::sync::Mutex::new(HashMap::new()),
+            replay_nonces: std::sync::Mutex::new(HashSet::new()),
             conns_active: AtomicU64::new(0),
         })
     }
 
     fn validate(&self, req: &AuthRequest) -> hydr_core::Result<AuthResponse> {
-        if req.auth == self.config.password.as_bytes() {
-            Ok(AuthResponse::ok(self.config.cc_rx, FEATURE_UDP))
-        } else {
-            Ok(AuthResponse::error("invalid credentials"))
+        if req.version != PROTOCOL_VERSION {
+            return Ok(AuthResponse::error_with_code(
+                ERR_UNSUPPORTED,
+                "unsupported protocol version",
+            ));
         }
+        if req.client_nonce.len() < 8 {
+            return Ok(AuthResponse::error_with_code(
+                ERR_PROTOCOL,
+                "client nonce too short",
+            ));
+        }
+        let expected = compute_auth_proof(self.config.password.as_bytes(), &req.client_nonce);
+        if !ct_eq(&expected, &req.auth_proof) {
+            return Ok(AuthResponse::error_with_code(
+                ERR_BAD_CREDENTIALS,
+                "invalid credentials",
+            ));
+        }
+        if !self.nonce_seen(&req.client_nonce) {
+            return Ok(AuthResponse::error_with_code(
+                ERR_PROTOCOL,
+                "replay detected",
+            ));
+        }
+        Ok(AuthResponse::ok(self.config.cc_rx, FEATURE_UDP))
+    }
+
+    /// Отмечает nonce как использованный; возвращает false, если он уже был
+    /// (попытка replay) или кэш переполнен и сброшен.
+    fn nonce_seen(&self, nonce: &[u8]) -> bool {
+        let mut cache = self.replay_nonces.lock().unwrap();
+        if cache.contains(nonce) {
+            return false;
+        }
+        cache.insert(nonce.to_vec());
+        if cache.len() > REPLAY_CACHE_MAX {
+            cache.clear();
+        }
+        true
     }
 
     /// Рейт-лимит попыток аутентификации по IP.
@@ -375,7 +420,7 @@ impl Server {
             Ok(p) => p,
             Err(e) => {
                 let _ = acc
-                    .reply(STATUS_ERR, e.to_string().as_bytes())
+                    .reply_with_code(STATUS_ERR, ERR_CONNECT_FAILED, e.to_string().as_bytes())
                     .await;
                 return;
             }

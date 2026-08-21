@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use hydr_client::{Client, ClientConfig, ClientTransport};
-use hydr_server::{Server, ServerConfig};
+use hydr_server::{Server, ServerConfig, WsListen};
 
 const PASSWORD: &str = "secret123";
 
@@ -215,6 +215,71 @@ async fn socks5_udp_end_to_end() {
         .unwrap();
     let (_, payload) = hydr_client::parse_udp_packet(&buf[..n]).unwrap();
     assert_eq!(payload, b"ping udp");
+}
+
+async fn spawn_ws_server() -> (Arc<Server>, String) {
+    let l = Server::make_ws_listener("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = l.local_addr().unwrap();
+    let mut cfg = ServerConfig {
+        password: PASSWORD.into(),
+        cc_rx: 0,
+        quic: None,
+        ws: None,
+        next_hop: None,
+        max_conns: 0,
+    };
+    cfg.ws = Some(WsListen {
+        bind: addr,
+        path: "/hydr".into(),
+        obfuscation: None,
+    });
+    let server = Server::new(cfg);
+    tokio::spawn(server.clone().run_ws_listener(l, "/hydr".into(), None));
+    (server, format!("ws://{addr}/hydr"))
+}
+
+async fn connect_client_ws(url: &str, bind: SocketAddr) -> Arc<Client> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let cfg = ClientConfig {
+            transport: ClientTransport::Ws {
+                url: url.to_string(),
+                insecure: true,
+                obfuscation: None,
+            },
+            password: PASSWORD.into(),
+            cc_rx: 0,
+            socks5_bind: bind,
+        };
+        match Client::connect(cfg).await {
+            Ok(c) => return Arc::new(c),
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("client ws connect failed: {e}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks5_tcp_over_ws_transport() {
+    let (echo, _eh) = echo_tcp().await;
+    let (_server, url) = spawn_ws_server().await;
+
+    let client = connect_client_ws(&url, "127.0.0.1:0".parse().unwrap()).await;
+    let listener = client.socks5_listener().await.unwrap();
+    let socks5_addr = listener.local_addr().unwrap();
+    tokio::spawn(client.clone().serve_datagrams());
+    tokio::spawn(client.clone().run_socks5_on(listener));
+
+    let target = Address::Ip(echo.ip(), echo.port());
+    let mut s = socks5_connect(socks5_addr, &target).await;
+    s.write_all(b"hello ws").await.unwrap();
+    let mut buf = [0u8; 8];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello ws");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

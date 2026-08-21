@@ -90,4 +90,45 @@ mod tests {
             assert_eq!(used, buf.len());
         }
     }
+
+    #[test]
+    fn empty_buffer_is_eof() {
+        assert!(Frame::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn truncated_body_is_eof() {
+        // stream_id=1 (1 байт), тип (1 байт), body_len=100, но тела нет
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 1);
+        buf.push(FRAME_STREAM_DATA);
+        encode_varint(&mut buf, 100);
+        assert!(Frame::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn zero_length_body_roundtrip() {
+        let f = Frame::new(7, FRAME_PING, Vec::new());
+        let mut buf = Vec::new();
+        f.encode(&mut buf);
+        let (d, used) = Frame::decode(&buf).unwrap();
+        assert_eq!(f, d);
+        assert_eq!(used, buf.len());
+    }
+
+    #[test]
+    fn large_stream_id_roundtrip() {
+        let f = Frame::data((1u64 << 40) + 123, vec![9; 4096]);
+        let mut buf = Vec::new();
+        f.encode(&mut buf);
+        let (d, used) = Frame::decode(&buf).unwrap();
+        assert_eq!(f, d);
+        assert_eq!(used, buf.len());
+    }
+
+    #[test]
+    fn max_frame_len_is_reasonable() {
+        // не должно быть бесконечным; 64KiB тела + заголовки
+        assert!(max_frame_len() < 100 * 1024);
+    }
 }

@@ -127,4 +127,57 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(used, buf.len());
     }
+
+    #[test]
+    fn bad_type_rejected() {
+        assert!(Address::decode(&[0x04, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn truncated_ipv4() {
+        // нужно 7 байт, даём 6
+        assert!(Address::decode(&[0x01, 1, 2, 3, 4, 5]).is_err());
+        assert!(Address::decode(&[0x01]).is_err());
+    }
+
+    #[test]
+    fn truncated_ipv6() {
+        // нужно 19 байт, даём 10
+        let mut buf = vec![0x02];
+        buf.extend_from_slice(&[0u8; 9]);
+        assert!(Address::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn truncated_domain_length() {
+        // тип 0x03, заявлена длина 10, но байтов нет
+        assert!(Address::decode(&[0x03, 10]).is_err());
+    }
+
+    #[test]
+    fn truncated_domain_body() {
+        // тип 0x03, длина 5, но телом только 2 байта + нет порта
+        let buf = vec![0x03, 5, b'a', b'b'];
+        assert!(Address::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn domain_zero_length_roundtrip() {
+        let a = Address::Domain("".into(), 0);
+        let mut buf = Vec::new();
+        a.encode(&mut buf);
+        let (b, used) = Address::decode(&buf).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(used, buf.len());
+    }
+
+    #[test]
+    fn max_port_roundtrip() {
+        let a = Address::Ip("192.168.0.1".parse().unwrap(), u16::MAX);
+        let mut buf = Vec::new();
+        a.encode(&mut buf);
+        let (b, used) = Address::decode(&buf).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(used, buf.len());
+    }
 }

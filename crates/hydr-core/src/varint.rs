@@ -66,4 +66,37 @@ mod tests {
         assert_eq!(encode_varint_len((1 << 14) - 1), 2);
         assert_eq!(encode_varint_len(1 << 14), 4);
     }
+
+    #[test]
+    fn decode_empty_is_eof() {
+        assert!(decode_varint(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_truncated_two_byte() {
+        // тег 0x40 => нужно 2 байта, но пришёл только один
+        assert!(decode_varint(&[0x40]).is_err());
+    }
+
+    #[test]
+    fn decode_truncated_four_byte() {
+        // тег 0x80 => нужно 4 байта
+        assert!(decode_varint(&[0x80, 0x01, 0x02]).is_err());
+    }
+
+    #[test]
+    fn decode_truncated_eight_byte() {
+        // тег 0xc0 => нужно 8 байт
+        assert!(decode_varint(&[0xc0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn decode_preserves_value_after_partial_write_never_panics() {
+        // однобайтовый varint всегда декодируется
+        for v in 0u64..=63 {
+            let mut buf = Vec::new();
+            encode_varint(&mut buf, v);
+            assert_eq!(decode_varint(&buf).unwrap().0, v);
+        }
+    }
 }

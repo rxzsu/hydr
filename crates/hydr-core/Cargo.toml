@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 blake3 = "1"
+getrandom = "0.2"

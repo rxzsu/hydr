@@ -50,19 +50,30 @@ a connection detail.
 The first message on every tunnel MUST be an `AuthRequest` on the control
 channel (stream id `0`). The server replies with an `AuthResponse`.
 
+The password is **never sent in clear text**. Instead the client generates a
+random `client_nonce` and proves knowledge of the password by sending
+`auth_proof = keyed_hash(password, client_nonce)` (BLAKE3 keyed hash). The
+server recomputes the value from its own password and the received nonce and
+compares it in constant time. Because `auth_proof` is bound to the nonce, a
+captured handshake cannot be replayed: the server remembers recently seen
+nonces and rejects duplicates.
+
 ```
 AuthRequest:
   [varint] version        (0x01)
-  [uint8]  auth_method    (0x01 = password)
-  [varint] auth_len
-  [bytes]  auth
+  [uint8]  auth_method    (0x01 = password-proof)
+  [varint] client_nonce_len
+  [bytes]  client_nonce   (>= 8 random bytes, replay protection)
+  [varint] auth_proof_len
+  [bytes]  auth_proof     (keyed_hash(password, client_nonce))
   [varint] cc_rx          (client max receive rate, bytes/s; 0 = unknown)
-  [uint8]  features       (bit 0 = UDP, bit 1 = MUX)
+  [uint8]  features       (bit 0 = UDP)
   [varint] padding_len
   [bytes]  padding
 
 AuthResponse:
   [uint8]  status          (0x00 = OK, 0x01 = Error)
+  [uint8]  error_code      (machine-readable; 0 when OK)
   [varint] msg_len
   [bytes]  msg
   [varint] server_cc_rx    (server max receive rate; 0 = unlimited)
@@ -70,6 +81,10 @@ AuthResponse:
   [varint] padding_len
   [bytes]  padding
 ```
+
+`error_code` values: `0x00` none, `0x01` bad credentials, `0x02` rate
+limited, `0x03` connect failed, `0x04` unsupported (e.g. protocol version),
+`0x05` protocol violation (e.g. replay), `0x06` internal.
 
 If authentication fails the server MUST close the tunnel.
 
@@ -86,6 +101,7 @@ OpenStream:
 
 OpenStreamAck:
   [uint8]  status   (0x00 = OK, 0x01 = Error)
+  [uint8]  error_code  (machine-readable; matches AuthResponse codes)
   [varint] msg_len
   [bytes]  msg
 ```
@@ -156,10 +172,13 @@ dispatched to the stream matching `stream_id`.
 
 ## Session Multiplexing (MUX)
 
-MUX allows many logical client sessions to share one transport connection.
-Each session runs its own `AuthRequest`/`AuthResponse` exchange. This is how
-multiple applications reuse a single tunnel, and it is the foundation of
-multi-hop chains.
+> **Status (draft v1.1):** not implemented. The `FEATURE_MUX` flag was removed
+> from the wire format; currently each transport connection carries a single
+> authenticated tunnel. Logical multiplexing over QUIC is already provided
+> natively by QUIC streams, and over WS by the frame `stream_id`. True
+> per-session re-authentication (each logical session performing its own
+> `AuthRequest`/`AuthResponse` exchange) remains future work and is the
+> foundation for multi-hop chains with distinct credentials per hop.
 
 ## Multi-hop / Chaining
 
@@ -191,12 +210,17 @@ An optional XOR obfuscation layer ("Salamander-style") MAY wrap every
 transport datagram/byte:
 
 ```
-[8 bytes] salt
-[bytes]   payload  (payload[i] ^= BLAKE3(key || salt)[i % 32])
+[8 bytes]  salt
+[bytes]    ciphertext  (ciphertext[i] ^= BLAKE3(key || salt)[i % 32])
+[16 bytes] tag         (keyed_hash(key32, ciphertext), first 16 bytes)
 ```
 
 Without the pre-shared obfuscation key the stream is indistinguishable from
-random bytes. Invalid packets are discarded.
+random bytes. The trailing `tag` is a keyed BLAKE3 MAC over the ciphertext, so
+a peer holding the wrong key (or a tampered message) fails verification and the
+frame is discarded. This gives the obfuscation layer integrity and
+authentication on top of its scrambling, protecting datagrams carried over WS
+(which otherwise have no per-message authentication of their own).
 
 The layer is configured per-endpoint with a pre-shared key. In the WS
 transport it is applied per WebSocket binary message: the frame bytes are

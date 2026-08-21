@@ -97,6 +97,7 @@ pub(crate) enum Cmd {
     ReplyOpen {
         id: u64,
         status: u8,
+        error_code: u8,
         message: Vec<u8>,
         a_read: WsRead,
         a_write: WsWrite,
@@ -251,6 +252,7 @@ pub(crate) async fn reply_open(
     cmd: &mpsc::Sender<Cmd>,
     id: u64,
     status: u8,
+    error_code: u8,
     message: Vec<u8>,
     a_read: WsRead,
     a_write: WsWrite,
@@ -258,6 +260,7 @@ pub(crate) async fn reply_open(
     cmd.send(Cmd::ReplyOpen {
         id,
         status,
+        error_code,
         message,
         a_read,
         a_write,
@@ -409,9 +412,14 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                             Err(_) => false,
                         }
                     }
-                    Cmd::ReplyOpen { id, status, message, a_read, a_write } => {
+                    Cmd::ReplyOpen { id, status, error_code, message, a_read, a_write } => {
                         let mut body = Vec::new();
-                        OpenStreamAck { status, message }.encode(&mut body);
+                        OpenStreamAck {
+                            status,
+                            error_code,
+                            message,
+                        }
+                        .encode(&mut body);
                         let f = Frame::new(id, FRAME_OPEN_STREAM_ACK, body);
                         match sink.send(outbound(&f, &obfuscation)).await {
                             Ok(()) => {

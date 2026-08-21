@@ -2,7 +2,7 @@ pub mod quic;
 pub mod tls;
 pub mod ws;
 
-use hydr_core::message::{OpenStream, OpenStreamAck, STATUS_ERR};
+use hydr_core::message::{OpenStream, OpenStreamAck, ERR_NONE, STATUS_ERR};
 use hydr_core::{Address, Datagram, Error, Result};
 pub use quic::{DynStream, ProxyStream, QuicTunnel};
 pub use ws::{IncomingOpen, WsEvent, WsHandle, WsTunnel};
@@ -35,9 +35,11 @@ impl TunnelHandle {
                 quic::write_len_prefixed(&mut send, &buf).await?;
                 let ack = quic::read_message(&mut recv, OpenStreamAck::decode).await?;
                 if ack.status == STATUS_ERR {
-                    return Err(Error::Message(
-                        String::from_utf8_lossy(&ack.message).to_string(),
-                    ));
+                    return Err(Error::Message(format!(
+                        "[code {}] {}",
+                        ack.error_code,
+                        String::from_utf8_lossy(&ack.message)
+                    )));
                 }
                 Ok(Box::new(quic::QuicStream { send, recv }))
             }
@@ -97,11 +99,21 @@ enum AcceptedInner {
 
 impl AcceptedStream {
     pub async fn reply(&mut self, status: u8, message: &[u8]) -> Result<()> {
+        self.reply_with_code(status, ERR_NONE, message).await
+    }
+
+    pub async fn reply_with_code(
+        &mut self,
+        status: u8,
+        error_code: u8,
+        message: &[u8],
+    ) -> Result<()> {
         match &mut self.inner {
             AcceptedInner::Quic { send, .. } => {
                 let mut buf = Vec::new();
                 OpenStreamAck {
                     status,
+                    error_code,
                     message: message.to_vec(),
                 }
                 .encode(&mut buf);
@@ -116,7 +128,7 @@ impl AcceptedStream {
             } => {
                 let a_read = a_read.take().ok_or(hydr_core::Error::StreamClosed)?;
                 let a_write = a_write.take().ok_or(hydr_core::Error::StreamClosed)?;
-                ws::reply_open(cmd, *id, status, message.to_vec(), a_read, a_write).await
+                ws::reply_open(cmd, *id, status, error_code, message.to_vec(), a_read, a_write).await
             }
         }
     }
