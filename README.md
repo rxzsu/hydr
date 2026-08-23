@@ -24,6 +24,7 @@ cargo build --release
 
 # server
 hydr-server -c examples/server.example.yaml
+# note the printed QUIC certificate fingerprint (sha256)
 
 # client
 hydr-client -c examples/client.example.yaml
@@ -32,8 +33,19 @@ hydr-client -c examples/client.example.yaml
 
 See [PROTOCOL.md](PROTOCOL.md) for the wire specification.
 
+## Security notes
+
+- Auth never sends the password: it proves knowledge via a keyed hash over a
+  random nonce, and the server rejects nonce replays.
+- Servers use self-signed certificates. The server prints its certificate's
+  SHA-256 fingerprint on startup; clients pin it (`fingerprint` in the
+  transport config) for MITM protection without a public CA. Persist the
+  server certificate to PEM files (`quic.cert` / `quic.key`) so the
+  fingerprint survives restarts.
+
 ## Status
 
-- Protocol draft **v1** implemented; QUIC + WS, TCP + UDP, obfuscation,
-  multi-hop, brutal CC, SOCKS5 client, CLI binaries.
-- 34 integration/unit tests green; clippy clean.
+- Protocol draft **v1.1** implemented; QUIC + WS, TCP + UDP, obfuscation,
+  multi-hop, brutal CC, SOCKS5 client (with tunnel-reconnect), per-stream WS
+  flow control, CLI binaries.
+- 110 integration/unit tests green; clippy clean.

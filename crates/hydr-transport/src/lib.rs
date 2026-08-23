@@ -137,9 +137,13 @@ impl AcceptedStream {
         match self.inner {
             AcceptedInner::Quic { send, recv } => Box::new(quic::QuicStream { send, recv }),
             AcceptedInner::Ws {
-                b_read, b_write, ..
+                cmd,
+                id,
+                b_read,
+                b_write,
+                ..
             } => Box::new(ws::DuplexIo {
-                r: b_read,
+                r: Box::new(ws::CreditReader::new(b_read, id, cmd)),
                 w: b_write,
             }),
         }

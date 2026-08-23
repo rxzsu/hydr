@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,6 +37,11 @@ pub struct ServerConfig {
 pub struct QuicListen {
     pub bind: SocketAddr,
     pub server_name: String,
+    /// Путь к PEM-сертификату (задаётся вместе с `key`). Без пары файлов
+    /// сервер генерирует ephemeral self-signed сертификат на каждый старт.
+    pub cert: Option<String>,
+    /// Путь к PEM-ключу.
+    pub key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -58,11 +63,14 @@ pub enum NextHopTransport {
         addr: SocketAddr,
         server_name: String,
         insecure: bool,
+        /// SHA-256 fingerprint сертификата следующего узла (hex).
+        fingerprint: Option<String>,
     },
     Ws {
         url: String,
         insecure: bool,
         obfuscation: Option<String>,
+        fingerprint: Option<String>,
     },
 }
 
@@ -73,12 +81,47 @@ pub struct Server {
     conn_permits: Arc<tokio::sync::Semaphore>,
     auth_attempts: std::sync::Mutex<HashMap<IpAddr, Vec<Instant>>>,
     /// Кэш использованных client_nonce для защиты от replay атак.
-    replay_nonces: std::sync::Mutex<HashSet<Vec<u8>>>,
+    replay_nonces: std::sync::Mutex<NonceCache>,
     conns_active: AtomicU64,
 }
 
-/// Максимальный размер кэша nonce; при превышении кэш сбрасывается.
+/// Максимальный размер кэша nonce; при превышении вытесняется самая старая
+/// запись. Раньше кэш сбрасывался целиком — флуд случайными nonce вымывал
+/// легитимные записи и открывал окно для replay.
 const REPLAY_CACHE_MAX: usize = 8192;
+
+/// Bounded FIFO-кэш nonce: O(1) вставка и вытеснение старейшей записи.
+struct NonceCache {
+    set: HashSet<Vec<u8>>,
+    order: VecDeque<Vec<u8>>,
+    cap: usize,
+}
+
+impl NonceCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Отмечает nonce как использованный; `false` — уже был (replay).
+    fn insert(&mut self, nonce: &[u8]) -> bool {
+        if self.set.contains(nonce) {
+            return false;
+        }
+        let key = nonce.to_vec();
+        self.set.insert(key.clone());
+        self.order.push_back(key);
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+}
 
 impl Server {
     pub fn new(config: ServerConfig) -> Arc<Self> {
@@ -93,7 +136,7 @@ impl Server {
             udp: UdpManager::new(),
             conn_permits: Arc::new(tokio::sync::Semaphore::new(max_conns)),
             auth_attempts: std::sync::Mutex::new(HashMap::new()),
-            replay_nonces: std::sync::Mutex::new(HashSet::new()),
+            replay_nonces: std::sync::Mutex::new(NonceCache::new(REPLAY_CACHE_MAX)),
             conns_active: AtomicU64::new(0),
         })
     }
@@ -128,17 +171,9 @@ impl Server {
     }
 
     /// Отмечает nonce как использованный; возвращает false, если он уже был
-    /// (попытка replay) или кэш переполнен и сброшен.
+    /// (попытка replay).
     fn nonce_seen(&self, nonce: &[u8]) -> bool {
-        let mut cache = self.replay_nonces.lock().unwrap();
-        if cache.contains(nonce) {
-            return false;
-        }
-        cache.insert(nonce.to_vec());
-        if cache.len() > REPLAY_CACHE_MAX {
-            cache.clear();
-        }
-        true
+        self.replay_nonces.lock().unwrap().insert(nonce)
     }
 
     /// Рейт-лимит попыток аутентификации по IP.
@@ -198,20 +233,36 @@ impl Server {
     }
 
     async fn run_quic(self: Arc<Self>, cfg: &QuicListen) {
-        let endpoint = match Self::make_quic_endpoint_with(cfg.bind, &cfg.server_name, self.config.cc_rx) {
+        let cert = match hydr_transport::tls::load_or_generate_self_signed(
+            &cfg.server_name,
+            cfg.cert.as_deref().map(std::path::Path::new),
+            cfg.key.as_deref().map(std::path::Path::new),
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!("quic cert load failed on {}: {e}", cfg.bind);
+                return;
+            }
+        };
+        let (endpoint, fp) = match Self::make_quic_endpoint_from_cert(cfg.bind, cert, self.config.cc_rx)
+        {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("quic listen failed on {}: {e}", cfg.bind);
                 return;
             }
         };
+        tracing::info!(
+            "QUIC certificate fingerprint (sha256): {} — pin it on the client",
+            hydr_transport::tls::fingerprint_hex(&fp)
+        );
         self.run_quic_endpoint(endpoint).await;
     }
 
     pub fn make_quic_endpoint(
         bind: SocketAddr,
         server_name: &str,
-    ) -> Result<quinn::Endpoint, Box<dyn std::error::Error>> {
+    ) -> Result<(quinn::Endpoint, [u8; 32]), Box<dyn std::error::Error>> {
         Self::make_quic_endpoint_with(bind, server_name, 0)
     }
 
@@ -219,11 +270,20 @@ impl Server {
         bind: SocketAddr,
         server_name: &str,
         cc_rx: u64,
-    ) -> Result<quinn::Endpoint, Box<dyn std::error::Error>> {
+    ) -> Result<(quinn::Endpoint, [u8; 32]), Box<dyn std::error::Error>> {
         let cert = hydr_transport::tls::generate_self_signed(server_name)?;
+        Self::make_quic_endpoint_from_cert(bind, cert, cc_rx)
+    }
+
+    pub fn make_quic_endpoint_from_cert(
+        bind: SocketAddr,
+        cert: hydr_transport::tls::GeneratedCert,
+        cc_rx: u64,
+    ) -> Result<(quinn::Endpoint, [u8; 32]), Box<dyn std::error::Error>> {
+        let fp = hydr_transport::tls::cert_fingerprint(&cert.cert_der);
         let rustls_cfg = hydr_transport::tls::make_server_config(cert.cert_der, cert.key_der)?;
         let quinn_cfg = quic::make_server_config(rustls_cfg, Some(hydr_cc::transport_config(cc_rx)))?;
-        Ok(quinn::Endpoint::server(quinn_cfg, bind)?)
+        Ok((quinn::Endpoint::server(quinn_cfg, bind)?, fp))
     }
 
     pub async fn run_quic_endpoint(self: Arc<Self>, endpoint: quinn::Endpoint) {
@@ -394,22 +454,28 @@ impl Server {
                 addr,
                 server_name,
                 insecure,
-            } => Ok(Tunnel::Quic(
-                quic::connect(
-                    *addr,
-                    server_name,
-                    *insecure,
-                    Some(quic::default_transport_config()),
-                    &auth,
-                )
-                .await?,
-            )),
-            NextHopTransport::Ws { url, insecure, obfuscation } => {
+                fingerprint,
+            } => {
+                let pin = hydr_transport::tls::require_fingerprint(fingerprint.as_deref())?;
+                Ok(Tunnel::Quic(
+                    quic::connect_with_tls(
+                        *addr,
+                        server_name,
+                        *insecure,
+                        pin,
+                        Some(quic::default_transport_config()),
+                        &auth,
+                    )
+                    .await?,
+                ))
+            }
+            NextHopTransport::Ws { url, insecure, obfuscation, fingerprint } => {
+                let pin = hydr_transport::tls::require_fingerprint(fingerprint.as_deref())?;
                 let ob = obfuscation
                     .clone()
                     .map(|k| Arc::new(hydr_core::obfuscation::Obfuscator::new(k.as_bytes())));
                 Ok(Tunnel::Ws(
-                    ws::connect_with_obfuscation(url, *insecure, &auth, ob).await?,
+                    ws::connect_with_tls(url, *insecure, pin, &auth, ob).await?,
                 ))
             }
         }
@@ -485,4 +551,35 @@ async fn resolve(addr: &hydr_core::Address) -> std::io::Result<tokio::net::TcpSt
 pub async fn bidirectional_copy(a: &mut DynStream, b: &mut DynStream) -> hydr_core::Result<()> {
     tokio::io::copy_bidirectional(a, b).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonce_cache_rejects_duplicates() {
+        let mut c = NonceCache::new(8);
+        assert!(c.insert(b"nonce-1"));
+        assert!(!c.insert(b"nonce-1"));
+        assert!(c.insert(b"nonce-2"));
+    }
+
+    #[test]
+    fn nonce_cache_evicts_oldest_not_everything() {
+        let mut c = NonceCache::new(4);
+        for i in 0..4 {
+            assert!(c.insert(format!("nonce-{i}").as_bytes()));
+        }
+        // переполнение: вытесняется только старейшая запись
+        assert!(c.insert(b"nonce-4"));
+        assert!(!c.insert(b"nonce-1"), "recent entries must stay cached");
+        assert!(!c.insert(b"nonce-3"));
+        assert!(c.insert(b"nonce-0"), "oldest entry must be evicted, not the whole cache");
+
+        // повторное переполнение не ломает инварианты
+        assert!(c.insert(b"nonce-5"));
+        assert_eq!(c.set.len(), c.order.len());
+        assert!(c.order.len() <= 4);
+    }
 }

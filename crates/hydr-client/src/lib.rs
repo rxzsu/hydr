@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hydr_core::message::{AuthRequest, FEATURE_UDP};
-use hydr_transport::{quic, ws, ProxyStream, Tunnel, TunnelHandle};
+use hydr_core::Address;
+use hydr_transport::{quic, ws, DynStream, ProxyStream, Tunnel, TunnelHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -26,11 +27,15 @@ pub enum ClientTransport {
         addr: SocketAddr,
         server_name: String,
         insecure: bool,
+        /// SHA-256 fingerprint сертификата сервера (hex) — пин вместо PKI.
+        fingerprint: Option<String>,
     },
     Ws {
         url: String,
         insecure: bool,
         obfuscation: Option<String>,
+        /// SHA-256 fingerprint сертификата TLS-терминатора (hex).
+        fingerprint: Option<String>,
     },
 }
 
@@ -40,6 +45,10 @@ pub struct Client {
     handle: Arc<tokio::sync::RwLock<TunnelHandle>>,
     udp: Arc<UdpRelay>,
     socks5_bind: SocketAddr,
+    /// Сериализует реконнекты: параллельные запросы ждут один и тот же.
+    reconnect_lock: tokio::sync::Mutex<()>,
+    /// Инкрементируется при каждом успешном реконнекте (дедупликация).
+    tunnel_gen: std::sync::atomic::AtomicU64,
 }
 
 impl Client {
@@ -55,6 +64,8 @@ impl Client {
             handle,
             udp,
             socks5_bind,
+            reconnect_lock: tokio::sync::Mutex::new(()),
+            tunnel_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -66,21 +77,33 @@ impl Client {
                 addr,
                 server_name,
                 insecure,
+                fingerprint,
             } => {
-                let fut = quic::connect(
+                let pin = hydr_transport::tls::require_fingerprint(fingerprint.as_deref())?;
+                if *insecure && pin.is_some() {
+                    tracing::warn!("both `insecure` and `fingerprint` set; the pin takes precedence");
+                }
+                let fut = quic::connect_with_tls(
                     *addr,
                     server_name,
                     *insecure,
+                    pin,
                     Some(hydr_cc::transport_config(config.cc_rx)),
                     &auth,
                 );
                 Ok(Tunnel::Quic(fut.await?))
             }
-            ClientTransport::Ws { url, insecure, obfuscation } => {
+            ClientTransport::Ws { url, insecure, obfuscation, fingerprint } => {
+                let pin = hydr_transport::tls::require_fingerprint(fingerprint.as_deref())?;
+                if *insecure && pin.is_some() {
+                    tracing::warn!("both `insecure` and `fingerprint` set; the pin takes precedence");
+                }
                 let ob = obfuscation
                     .clone()
                     .map(|k| Arc::new(hydr_core::obfuscation::Obfuscator::new(k.as_bytes())));
-                Ok(Tunnel::Ws(ws::connect_with_obfuscation(url, *insecure, &auth, ob).await?))
+                Ok(Tunnel::Ws(
+                    ws::connect_with_tls(url, *insecure, pin, &auth, ob).await?,
+                ))
             }
         }
     }
@@ -94,7 +117,44 @@ impl Client {
         let handle = TunnelHandle::from_tunnel(&tunnel);
         drop(tunnel);
         *self.handle.write().await = handle;
+        self.tunnel_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Реконнект с дедупликацией: если другой таск уже переподключился,
+    /// пока мы ждали лок, повторно не подключаемся.
+    async fn reconnect_sync(&self) -> hydr_core::Result<()> {
+        let seen = self.tunnel_gen.load(std::sync::atomic::Ordering::Acquire);
+        let _guard = self.reconnect_lock.lock().await;
+        if self.tunnel_gen.load(std::sync::atomic::Ordering::Acquire) != seen {
+            return Ok(());
+        }
+        self.reconnect().await
+    }
+
+    fn is_transport_error(e: &hydr_core::Error) -> bool {
+        matches!(
+            e,
+            hydr_core::Error::StreamClosed | hydr_core::Error::Io(_)
+        )
+    }
+
+    /// Открывает поток с одним ретраем: транспортный сбой трактуется как смерть
+    /// туннеля → реконнект и повтор. Ошибка уровня протокола (`Message`,
+    /// например отказ целевого хоста) не ретраится.
+    pub async fn open_stream_resilient(&self, addr: &Address) -> hydr_core::Result<DynStream> {
+        let handle = self.handle.read().await.clone();
+        match handle.open_stream(addr).await {
+            Ok(s) => Ok(s),
+            Err(e) if Self::is_transport_error(&e) => {
+                tracing::debug!("open_stream failed ({e}); reconnecting tunnel and retrying");
+                self.reconnect_sync().await?;
+                let handle = self.handle.read().await.clone();
+                handle.open_stream(addr).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn tunnel_handle(&self) -> TunnelHandle {
@@ -192,8 +252,7 @@ impl Client {
         let req = socks5::read_request(&mut tcp).await?;
         match req.cmd {
             socks5::CMD_CONNECT => {
-                let handle = self.handle.read().await.clone();
-                let mut peer_stream = match handle.open_stream(&req.address).await {
+                let mut peer_stream = match self.open_stream_resilient(&req.address).await {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = tcp.write_all(&[5, 0x04, 0, 1, 0, 0, 0, 0, 0, 0]).await;

@@ -11,9 +11,14 @@ transport:
   type: quic
   addr: "1.2.3.4:8443"
   server_name: "example.com"
+  # SHA-256 fingerprint of the server certificate (hex, 64 chars).
+  # The server prints it on startup. Prefer this over insecure: true —
+  # it protects against MITM without a public CA.
+  # fingerprint: "a1b2c3...64-hex-chars"
   insecure: true
 # or WebSocket:
 #   type: ws
 #   url: "wss://example.com/hydr"
 #   insecure: false
 #   obfuscation: "my-secret-key"
+#   fingerprint: "a1b2c3...64-hex-chars"

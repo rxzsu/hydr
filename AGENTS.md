@@ -58,20 +58,34 @@ handshake этого не любит.
   UDP = QUIC unreliable datagrams (RFC 9221). Шифрует сам QUIC (TLS 1.3).
 - **WebSocket**: один байтовый поток → мультиплексирующий `Frame`
   (`stream_id`, `type`, `body_len`, `body`). Обфускация (XOR + MAC) применяется
-  на WS, не на QUIC.
+  на WS, не на QUIC. Внутри `run()`: writer-таска — единственный владелец
+  sink'а; входящие StreamData доставляются в пер-стрименные очереди
+  (`stream_writer`), исходящие идут через pump с кредитным окном — не убирай
+  эти прослойки, иначе вернётся head-of-line blocking между стримами.
+- **TLS identity**: сервер логирует SHA-256 fingerprint своего сертификата при
+  старте; клиент может пиновать его (`fingerprint` в конфиге транспорта,
+  `tls::make_client_config_with_pin`) вместо `insecure: true`. Сервер может
+  хранить cert/key в PEM-файлах (`quic.cert`/`quic.key` в конфиге) — тогда
+  fingerprint стабилен между рестартами (`tls::load_or_generate_self_signed`).
 
 ### Аутентификация (важно при правках)
 `AuthRequest` НЕ шлёт пароль. Клиент генерит `client_nonce` (16 байт, CSPRNG)
 и шлёт `auth_proof = keyed_hash(password, nonce)` (BLAKE3 keyed hash). Сервер
-пересчитывает и сравнивает constant-time (`ct_eq`). Сервер хранит bounded-кэш
-использованных nonce → повторный коннект с тем же nonce отклоняется
-(`ERR_PROTOCOL`). Смена формата `AuthRequest` ломает все хендшейки — обновляй
-и клиента, и сервер, и тесты синхронно.
+пересчитывает и сравнивает constant-time (`ct_eq`). Сервер хранит bounded FIFO-кэш
+использованных nonce (вытеснение старейшей записи, не полная очистка) → повторный
+коннект с тем же nonce отклоняется (`ERR_PROTOCOL`). Смена формата `AuthRequest`
+ломает все хендшейки — обновляй и клиента, и сервер, и тесты синхронно.
 
 ### Коды ошибок
 `AuthResponse` и `OpenStreamAck` несут `error_code` (машиночитаемый):
 `0` none, `1` bad credentials, `2` rate limited, `3` connect failed,
 `4` unsupported, `5` protocol violation (replay), `6` internal.
+
+### Flow control WS (кадр 0x0b)
+WS-стримы регулируются кредитами: получатель по мере чтения приложением шлёт
+`FRAME_STREAM_CREDIT` (varint), отправитель (`pump_stream`) останавливает стрим
+при исчерпании окна `RECV_WINDOW` = 512 KiB. Ожидание — в таске самого стрима,
+чужие стримы и control-кадры не страдают. Старые пиры игнорируют 0x0b.
 
 ### Обфускация
 `Obfuscator` (только WS): `salt(8) || body(XOR) || tag(16, keyed BLAKE3)`, где

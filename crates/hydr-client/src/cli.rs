@@ -37,6 +37,10 @@ pub enum TransportFile {
         server_name: String,
         #[serde(default)]
         insecure: bool,
+        /// SHA-256 fingerprint сертификата сервера (hex, 64 символа);
+        /// надёжнее `insecure: true` — защита от MITM без PKI.
+        #[serde(default)]
+        fingerprint: Option<String>,
     },
     Ws {
         url: String,
@@ -44,6 +48,8 @@ pub enum TransportFile {
         insecure: bool,
         #[serde(default)]
         obfuscation: Option<String>,
+        #[serde(default)]
+        fingerprint: Option<String>,
     },
 }
 

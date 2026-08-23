@@ -2,28 +2,90 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 use futures_util::{SinkExt, StreamExt};
 use hydr_core::frame::{
     Frame, FRAME_AUTH_REQUEST, FRAME_AUTH_RESPONSE, FRAME_DATAGRAM, FRAME_OPEN_STREAM,
-    FRAME_OPEN_STREAM_ACK, FRAME_PING, FRAME_PONG, FRAME_STREAM_CLOSE, FRAME_STREAM_DATA,
+    FRAME_OPEN_STREAM_ACK, FRAME_PING, FRAME_PONG, FRAME_STREAM_CLOSE, FRAME_STREAM_CREDIT,
+    FRAME_STREAM_DATA,
 };
 use hydr_core::message::{AuthRequest, AuthResponse, Datagram, OpenStream, OpenStreamAck, ERR_PROTOCOL, STATUS_ERR, STATUS_OK};
 use hydr_core::obfuscation::{DecryptOutcome, Obfuscator};
+use hydr_core::varint::{decode_varint, encode_varint};
 use hydr_core::{Address, Error, Result};
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_tungstenite::tungstenite::http::Response as HttpResponse;
 use tokio_tungstenite::tungstenite::{Bytes, Message};
 use tokio_tungstenite::WebSocketStream;
+use tracing::trace;
 
 use crate::quic::{DynStream, ProxyStream};
 
 pub type WsRead = ReadHalf<DuplexStream>;
 pub type WsWrite = WriteHalf<DuplexStream>;
+
+/// Глубина общей очереди исходящих кадров; переполнение блокирует отправителей
+/// (backpressure доходит до источников данных).
+const OUTBOUND_QUEUE: usize = 256;
+/// Очередь на один стрим: медленный получатель не должен выедать общий канал.
+const STREAM_OUT_QUEUE: usize = 8;
+/// Окно flow control на один WS-стрим: сколько байт отправитель может послать
+/// без кредита получателя. Аналог STREAM flow control в HTTP/2/QUIC — не даёт
+/// одному стриму заблокировать остальные.
+const RECV_WINDOW: u64 = 512 * 1024;
+/// Получатель возвращает кредит пачками по мере чтения приложением.
+const CREDIT_BATCH: u64 = RECV_WINDOW / 2;
+
+/// Счётчик байтов, отправленных в стрим без подтверждения получения.
+struct StreamCredit {
+    outstanding: tokio::sync::Mutex<u64>,
+    notify: Notify,
+}
+
+impl StreamCredit {
+    fn new() -> Self {
+        Self {
+            outstanding: tokio::sync::Mutex::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Ждёт, пока окно не позволит послать следующий чанк.
+    async fn wait_window(&self) {
+        loop {
+            let fut = self.notify.notified();
+            tokio::pin!(fut);
+            if *self.outstanding.lock().await < RECV_WINDOW {
+                return;
+            }
+            // enable() до повторной проверки: не теряем уведомление,
+            // пришедшее между проверкой и подпиской
+            fut.as_mut().enable();
+            if *self.outstanding.lock().await < RECV_WINDOW {
+                return;
+            }
+            fut.await;
+        }
+    }
+
+    async fn sent(&self, n: u64) {
+        *self.outstanding.lock().await += n;
+    }
+
+    async fn grant(&self, n: u64) {
+        let mut o = self.outstanding.lock().await;
+        *o = o.saturating_sub(n);
+        drop(o);
+        self.notify.notify_waiters();
+    }
+}
+
+/// Таблица кредитов активных стримов (по stream_id).
+type CreditTable = Arc<Mutex<HashMap<u64, Arc<StreamCredit>>>>;
 
 #[derive(Clone)]
 pub struct WsHandle {
@@ -49,7 +111,10 @@ impl WsHandle {
             .await
             .map_err(|_| Error::StreamClosed)?;
         ack_rx.await.map_err(|_| Error::StreamClosed)??;
-        Ok(Box::new(DuplexIo { r: b_read, w: b_write }))
+        Ok(Box::new(DuplexIo {
+            r: Box::new(CreditReader::new(b_read, id, self.cmd.clone())),
+            w: b_write,
+        }))
     }
 
     /// MUX: как `open_stream`, но с явным `id` сессии (без инкремента счётчика).
@@ -69,15 +134,26 @@ impl WsHandle {
             .await
             .map_err(|_| Error::StreamClosed)?;
         ack_rx.await.map_err(|_| Error::StreamClosed)??;
-        Ok(Box::new(DuplexIo { r: b_read, w: b_write }))
+        Ok(Box::new(DuplexIo {
+            r: Box::new(CreditReader::new(b_read, id, self.cmd.clone())),
+            w: b_write,
+        }))
     }
 
     pub fn send_datagram(&self, dg: &Datagram) -> Result<()> {
         let mut body = Vec::new();
         dg.encode(&mut body);
         let frame = Frame::new(0, FRAME_DATAGRAM, body);
-        let _ = self.cmd.try_send(Cmd::SendFrame(frame));
-        Ok(())
+        match self.cmd.try_send(Cmd::SendFrame(frame)) {
+            Ok(()) => Ok(()),
+            // переполнение очереди — транзиентная перегрузка; для UDP честнее
+            // тихо дропнуть пакет, чем убивать сессию
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                trace!("ws outbound queue full; dropping datagram");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::StreamClosed),
+        }
     }
 
     /// Закрывает WS-соединение (останавливает цикл `run`).
@@ -214,7 +290,7 @@ impl WsTunnel {
 }
 
 pub struct DuplexIo {
-    pub(crate) r: WsRead,
+    pub(crate) r: Box<dyn AsyncRead + Send + Unpin>,
     pub(crate) w: WsWrite,
 }
 
@@ -226,7 +302,7 @@ impl AsyncRead for DuplexIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.r).poll_read(cx, buf)
+        Pin::new(&mut *self.r).poll_read(cx, buf)
     }
 }
 
@@ -260,6 +336,58 @@ fn encode_frame(f: &Frame) -> Vec<u8> {
     buf
 }
 
+/// Обёртка над app-стороной чтения стрима: считает прочитанные приложением
+/// байты и возвращает отправителю кредит (`FRAME_STREAM_CREDIT`) пачками.
+/// Так backpressure медленного приложения не блокирует общий цикл —
+/// отправитель конкретного стрима ждёт в своей таске.
+pub(crate) struct CreditReader {
+    inner: WsRead,
+    id: u64,
+    pending: u64,
+    cmd_tx: mpsc::Sender<Cmd>,
+}
+
+impl CreditReader {
+    pub(crate) fn new(inner: WsRead, id: u64, cmd_tx: mpsc::Sender<Cmd>) -> Self {
+        Self {
+            inner,
+            id,
+            pending: 0,
+            cmd_tx,
+        }
+    }
+}
+
+impl AsyncRead for CreditReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        ready!(Pin::new(&mut self.inner).poll_read(cx, buf))?;
+        let n = (buf.filled().len() - before) as u64;
+        if n > 0 {
+            self.pending += n;
+            if self.pending >= CREDIT_BATCH {
+                let amt = self.pending;
+                let mut body = Vec::new();
+                encode_varint(&mut body, amt);
+                // очередь полна — вернём кредит при следующем чтении;
+                // канал мёртв — кредиты больше никому не нужны
+                if self
+                    .cmd_tx
+                    .try_send(Cmd::SendFrame(Frame::new(self.id, FRAME_STREAM_CREDIT, body)))
+                    .is_ok()
+                {
+                    self.pending = 0;
+                }
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
 fn outbound(f: &Frame, ob: &Option<Arc<Obfuscator>>) -> Message {
     let mut b = encode_frame(f);
     if let Some(ob) = ob {
@@ -289,23 +417,79 @@ fn inbound(bytes: &[u8], ob: &Option<Arc<Obfuscator>>) -> Inbound {
     }
 }
 
-async fn pump_stream(cmd_tx: mpsc::Sender<Cmd>, id: u64, mut a_read: WsRead) {
-    let mut buf = [0u8; 32 * 1024];
-    loop {
-        match a_read.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let f = Frame::data(id, buf[..n].to_vec());
+/// Владелец сетевой половины дуплекса: пишет байты кадра STREAM_DATA строго
+/// по порядку; закрытие канала = peer прислал STREAM_CLOSE.
+async fn stream_writer(mut w: WsWrite, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    while let Some(chunk) = rx.recv().await {
+        if w.write_all(&chunk).await.is_err() {
+            return;
+        }
+    }
+    let _ = w.shutdown().await;
+}
+
+async fn pump_stream(
+    cmd_tx: mpsc::Sender<Cmd>,
+    id: u64,
+    credit: Arc<StreamCredit>,
+    mut a_read: WsRead,
+) {
+    let (q_tx, mut q_rx) = mpsc::channel::<Frame>(STREAM_OUT_QUEUE);
+    let fwd = tokio::spawn({
+        let cmd_tx = cmd_tx.clone();
+        async move {
+            while let Some(f) = q_rx.recv().await {
                 if cmd_tx.send(Cmd::SendFrame(f)).await.is_err() {
                     return;
                 }
             }
+        }
+    });
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        // flow control: ждём окно в СВОЕЙ таске, не мешая другим стримам
+        credit.wait_window().await;
+        match a_read.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if q_tx.send(Frame::data(id, buf[..n].to_vec())).await.is_err() {
+                    break;
+                }
+                credit.sent(n as u64).await;
+            }
             Err(_) => break,
         }
     }
+    drop(q_tx);
+    let _ = fwd.await;
+    // close уходит строго после данных этого стрима
     let _ = cmd_tx
         .send(Cmd::SendFrame(Frame::new(id, FRAME_STREAM_CLOSE, vec![])))
         .await;
+}
+
+/// Сообщение для writer'а: hydr-кадр или ответ на WS-уровневый ping.
+enum OutMsg {
+    Frame(Frame),
+    WsPong(Bytes),
+}
+
+/// Единственный владелец sink'а: медленная запись в TCP блокирует только эту
+/// таску, а не обработку входящих кадров и служебных сообщений.
+async fn writer<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut sink: futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
+    mut rx: mpsc::Receiver<OutMsg>,
+    obfuscation: Option<Arc<Obfuscator>>,
+) {
+    while let Some(msg) = rx.recv().await {
+        let msg = match msg {
+            OutMsg::Frame(f) => outbound(&f, &obfuscation),
+            OutMsg::WsPong(payload) => Message::Pong(payload),
+        };
+        if sink.send(msg).await.is_err() {
+            return;
+        }
+    }
 }
 
 type ServerValidator = Arc<dyn Fn(&AuthRequest) -> Result<AuthResponse> + Send + Sync>;
@@ -347,8 +531,20 @@ pub async fn connect_with_obfuscation(
     auth: &AuthRequest,
     obfuscation: Option<Arc<Obfuscator>>,
 ) -> Result<WsTunnel> {
+    connect_with_tls(url, insecure, None, auth, obfuscation).await
+}
+
+/// Как `connect_with_obfuscation`, но с опциональным пином SHA-256
+/// сертификата сервера (для `wss://`): защита от MITM без PKI.
+pub async fn connect_with_tls(
+    url: &str,
+    insecure: bool,
+    cert_pin: Option<[u8; 32]>,
+    auth: &AuthRequest,
+    obfuscation: Option<Arc<Obfuscator>>,
+) -> Result<WsTunnel> {
     let ws = if url.starts_with("wss://") {
-        let cfg = crate::tls::make_client_config(insecure);
+        let cfg = crate::tls::make_client_config_with_pin(insecure, cert_pin);
         tokio_tungstenite::connect_async_tls_with_config(
             url,
             None,
@@ -361,7 +557,7 @@ pub async fn connect_with_obfuscation(
     };
     let (ws, _) = ws.map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
 
-    let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+    let (cmd_tx, cmd_rx) = mpsc::channel(OUTBOUND_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(1024);
     let (auth_tx, auth_rx) = oneshot::channel();
 
@@ -430,7 +626,7 @@ pub async fn accept_with_obfuscation(
     .await
     .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
 
-    let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+    let (cmd_tx, cmd_rx) = mpsc::channel(OUTBOUND_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(1024);
     let (auth_tx, auth_rx) = oneshot::channel();
 
@@ -462,7 +658,7 @@ pub async fn accept_with_obfuscation(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run<S: AsyncRead + AsyncWrite + Unpin>(
+async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     ws: WebSocketStream<S>,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     event_tx: mpsc::Sender<WsEvent>,
@@ -474,26 +670,29 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     cmd_tx: mpsc::Sender<Cmd>,
     obfuscation: Option<Arc<Obfuscator>>,
 ) {
-    let (mut sink, mut stream) = ws.split();
-    let mut streams: HashMap<u64, WsWrite> = HashMap::new();
+    let (sink, mut stream) = ws.split();
+    let (frame_tx, frame_rx) = mpsc::channel::<OutMsg>(OUTBOUND_QUEUE);
+    let mut writer_task = tokio::spawn(writer(sink, frame_rx, obfuscation.clone()));
+    let credits: CreditTable = Arc::new(Mutex::new(HashMap::new()));
+    // stream_id -> очередь байтов для записи в дуплекс (неблокирующая доставка)
+    let mut streams: HashMap<u64, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
     let mut pending: HashMap<u64, PendingOpen> = HashMap::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
         tokio::select! {
+            res = &mut writer_task => {
+                // сокет умер / запись не удалась — соединение бесполезно
+                let _ = res;
+                break;
+            }
             Some(cmd) = cmd_rx.recv() => {
                 let done = match cmd {
-                    Cmd::SendFrame(f) => {
-                        match sink.send(outbound(&f, &obfuscation)).await {
-                            Ok(()) => true,
-                            Err(_) => false,
-                        }
-                    }
+                    Cmd::SendFrame(f) => frame_tx.send(OutMsg::Frame(f)).await.is_ok(),
                     Cmd::Open { id, addr, a_read, a_write, ack } => {
                         let mut body = Vec::new();
                         OpenStream { address: addr }.encode(&mut body);
-                        let f = Frame::new(id, FRAME_OPEN_STREAM, body);
-                        match sink.send(outbound(&f, &obfuscation)).await {
+                        match frame_tx.send(OutMsg::Frame(Frame::new(id, FRAME_OPEN_STREAM, body))).await {
                             Ok(()) => {
                                 pending.insert(id, PendingOpen { a_read, a_write, ack });
                                 true
@@ -509,13 +708,16 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                             message,
                         }
                         .encode(&mut body);
-                        let f = Frame::new(id, FRAME_OPEN_STREAM_ACK, body);
-                        match sink.send(outbound(&f, &obfuscation)).await {
+                        match frame_tx.send(OutMsg::Frame(Frame::new(id, FRAME_OPEN_STREAM_ACK, body))).await {
                             Ok(()) => {
                                 if status == STATUS_OK {
                                     let sid = id;
-                                    tokio::spawn(pump_stream(cmd_tx.clone(), sid, a_read));
-                                    streams.insert(sid, a_write);
+                                    let credit = Arc::new(StreamCredit::new());
+                                    credits.lock().unwrap().insert(sid, credit.clone());
+                                    tokio::spawn(pump_stream(cmd_tx.clone(), sid, credit, a_read));
+                                    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                                    tokio::spawn(stream_writer(a_write, rx));
+                                    streams.insert(sid, tx);
                                 }
                                 true
                             }
@@ -533,7 +735,7 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(Message::Binary(bytes)) => {
                         match inbound(&bytes, &obfuscation) {
                             Inbound::Frame(bytes) => {
-                                if handle_frame(&mut sink, &bytes, &mut streams, &mut pending, &mut auth_response, &auth, &sessions, &mut server_auth_done, &pending_auth, &event_tx, &cmd_tx, &obfuscation).await.is_err() {
+                                if handle_frame(&frame_tx, &bytes, &mut streams, &mut pending, &credits, &mut auth_response, &auth, &sessions, &mut server_auth_done, &pending_auth, &event_tx, &cmd_tx).await.is_err() {
                                     break;
                                 }
                             }
@@ -544,14 +746,16 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     Ok(Message::Ping(payload)) => {
-                        let _ = sink.send(Message::Pong(payload)).await;
+                        let _ = frame_tx.try_send(OutMsg::WsPong(payload));
                     }
                     Ok(_) => {}
                     Err(_) => break,
                 }
             }
             _ = tick.tick() => {
-                let _ = sink.send(Message::Ping(Bytes::new())).await;
+                if frame_tx.send(OutMsg::Frame(Frame::ping())).await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -565,11 +769,12 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
-    sink: &mut futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
+async fn handle_frame(
+    frame_tx: &mpsc::Sender<OutMsg>,
     bytes: &[u8],
-    streams: &mut HashMap<u64, WsWrite>,
+    streams: &mut HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>,
     pending: &mut HashMap<u64, PendingOpen>,
+    credits: &CreditTable,
     auth_response: &mut Option<oneshot::Sender<Result<AuthResponse>>>,
     auth: &Option<ServerValidator>,
     sessions: &Option<SessionTable>,
@@ -577,7 +782,6 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
     pending_auth: &Option<PendingAuthMap>,
     event_tx: &mpsc::Sender<WsEvent>,
     cmd_tx: &mpsc::Sender<Cmd>,
-    obfuscation: &Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let (frame, _) = Frame::decode(bytes)?;
     match frame.frame_type {
@@ -608,10 +812,14 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
                 let mut body = Vec::new();
                 resp.encode(&mut body);
                 // ответ шлем на тот же stream_id (0 = control, sid = session)
-                let f = Frame::new(frame.stream_id, FRAME_AUTH_RESPONSE, body);
-                sink.send(outbound(&f, obfuscation))
+                frame_tx
+                    .send(OutMsg::Frame(Frame::new(
+                        frame.stream_id,
+                        FRAME_AUTH_RESPONSE,
+                        body,
+                    )))
                     .await
-                    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                    .map_err(|_| Error::StreamClosed)?;
             }
         }
         FRAME_AUTH_RESPONSE => {
@@ -641,10 +849,14 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 let mut body = Vec::new();
                 ack.encode(&mut body);
-                let f = Frame::new(frame.stream_id, FRAME_OPEN_STREAM_ACK, body);
-                sink.send(outbound(&f, obfuscation))
+                frame_tx
+                    .send(OutMsg::Frame(Frame::new(
+                        frame.stream_id,
+                        FRAME_OPEN_STREAM_ACK,
+                        body,
+                    )))
                     .await
-                    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                    .map_err(|_| Error::StreamClosed)?;
                 return Ok(());
             }
             if let Ok((req, _)) = OpenStream::decode(&frame.body) {
@@ -668,8 +880,12 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
                 match OpenStreamAck::decode(&frame.body).map(|(a, _)| a) {
                     Ok(ack) if ack.status == STATUS_OK => {
                         let id = frame.stream_id;
-                        tokio::spawn(pump_stream(cmd_tx.clone(), id, p.a_read));
-                        streams.insert(id, p.a_write);
+                        let credit = Arc::new(StreamCredit::new());
+                        credits.lock().unwrap().insert(id, credit.clone());
+                        tokio::spawn(pump_stream(cmd_tx.clone(), id, credit, p.a_read));
+                        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                        tokio::spawn(stream_writer(p.a_write, rx));
+                        streams.insert(id, tx);
                         let _ = p.ack.send(Ok(()));
                     }
                     Ok(ack) => {
@@ -684,14 +900,27 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         FRAME_STREAM_DATA => {
-            if let Some(w) = streams.get_mut(&frame.stream_id) {
-                let _ = w.write_all(&frame.body).await;
+            // неблокирующая доставка: очередь дренирует отдельная таска;
+            // объём неспешных данных ограничен кредитным окном отправителя
+            if let Some(tx) = streams.get(&frame.stream_id) {
+                let _ = tx.send(frame.body);
+            }
+        }
+        FRAME_STREAM_CREDIT => {
+            // получатель прочитал байты приложения — освобождаем окно отправителю
+            if frame.stream_id != 0
+                && let Ok((amt, _)) = decode_varint(&frame.body)
+            {
+                let c = credits.lock().unwrap().get(&frame.stream_id).cloned();
+                if let Some(c) = c {
+                    c.grant(amt).await;
+                }
             }
         }
         FRAME_STREAM_CLOSE => {
-            if let Some(mut w) = streams.remove(&frame.stream_id) {
-                let _ = w.shutdown().await;
-            }
+            credits.lock().unwrap().remove(&frame.stream_id);
+            // дроп tx закрывает канал: stream_writer допишет хвост и shutdown
+            streams.remove(&frame.stream_id);
         }
         FRAME_DATAGRAM => {
             // MUX: датаграммы вне авторизованной сессии отбрасываются
@@ -706,9 +935,10 @@ async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         FRAME_PING => {
-            sink.send(outbound(&Frame::new(0, FRAME_PONG, frame.body), obfuscation))
+            frame_tx
+                .send(OutMsg::Frame(Frame::new(0, FRAME_PONG, frame.body)))
                 .await
-                .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                .map_err(|_| Error::StreamClosed)?;
         }
         _ => {}
     }

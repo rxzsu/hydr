@@ -43,7 +43,8 @@ async fn echo_udp() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 }
 
 async fn spawn_quic() -> (Arc<Server>, SocketAddr) {
-    let ep = Server::make_quic_endpoint("127.0.0.1:0".parse().unwrap(), "localhost").unwrap();
+    let (ep, _fp) =
+        Server::make_quic_endpoint("127.0.0.1:0".parse().unwrap(), "localhost").unwrap();
     let addr = ep.local_addr().unwrap();
     let server = Server::new(ServerConfig {
         password: PASSWORD.into(),
@@ -65,6 +66,7 @@ async fn connect_client(server_quic: SocketAddr, bind: SocketAddr) -> Arc<Client
                 addr: server_quic,
                 server_name: "localhost".into(),
                 insecure: true,
+                fingerprint: None,
             },
             password: PASSWORD.into(),
             cc_rx: 0,
@@ -189,6 +191,31 @@ async fn client_reconnects_after_tunnel_close() {
     assert!(reconnected, "клиент должен переподключиться после обрыва");
 }
 
+/// Ретрой внутри open_stream_resilient: первый же запрос после смерти туннеля
+/// проходит без ожидания фонового цикла реконнекта.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks5_connect_survives_dead_tunnel_immediately() {
+    let (echo, _eh) = echo_tcp().await;
+    let (_server, quic_addr) = spawn_quic().await;
+
+    let client = connect_client(quic_addr, "127.0.0.1:0".parse().unwrap()).await;
+    let listener = client.socks5_listener().await.unwrap();
+    let socks5_addr = listener.local_addr().unwrap();
+    // serve_datagrams намеренно не запущен: реконнект должен выполнить сам запрос
+    tokio::spawn(client.clone().run_socks5_on(listener));
+
+    client.force_close().await;
+
+    let target = Address::Ip(echo.ip(), echo.port());
+    let mut s = try_socks5_connect(socks5_addr, &target)
+        .await
+        .expect("first request after tunnel death must reconnect on its own");
+    s.write_all(b"after").await.unwrap();
+    let mut buf = [0u8; 5];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"after");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks5_udp_end_to_end() {
     let (echo, _eh) = echo_udp().await;
@@ -248,6 +275,7 @@ async fn connect_client_ws(url: &str, bind: SocketAddr) -> Arc<Client> {
                 url: url.to_string(),
                 insecure: true,
                 obfuscation: None,
+                fingerprint: None,
             },
             password: PASSWORD.into(),
             cc_rx: 0,

@@ -10,6 +10,11 @@ max_conns: 0
 quic:
   bind: "0.0.0.0:8443"
   server_name: "example.com"
+  # optional PEM cert/key pair: keeps the certificate (and its fingerprint,
+  # which clients pin) stable across restarts; without them a fresh
+  # self-signed certificate is generated on every start and printed to the log
+  # cert: "/etc/hydr/cert.pem"
+  # key: "/etc/hydr/key.pem"
 
 ws:
   bind: "0.0.0.0:8080"
@@ -25,6 +30,7 @@ ws:
 #     addr: "2.2.2.2:8443"
 #     server_name: "hop.example.com"
 #     insecure: true
+#     # fingerprint: "<sha256 of the hop certificate, hex>"
 #   # or:
 #   # type: ws
 #   # url: "wss://hop.example.com/hydr"

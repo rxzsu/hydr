@@ -62,12 +62,13 @@ fn auth() -> AuthRequest {
     AuthRequest::new_password(PASSWORD.as_bytes(), 0, FEATURE_UDP)
 }
 
-async fn spawn_quic(cfg: ServerConfig) -> (Arc<Server>, SocketAddr) {
-    let ep = Server::make_quic_endpoint("127.0.0.1:0".parse().unwrap(), "localhost").unwrap();
+async fn spawn_quic(cfg: ServerConfig) -> (Arc<Server>, SocketAddr, [u8; 32]) {
+    let (ep, fp) =
+        Server::make_quic_endpoint("127.0.0.1:0".parse().unwrap(), "localhost").unwrap();
     let addr = ep.local_addr().unwrap();
     let server = Server::new(cfg);
     tokio::spawn(server.clone().run_quic_endpoint(ep));
-    (server, addr)
+    (server, addr, fp)
 }
 
 async fn spawn_ws(cfg: ServerConfig) -> (Arc<Server>, String) {
@@ -133,7 +134,7 @@ async fn echo_udp_via_tunnel(tunnel: &mut hydr_transport::Tunnel, echo: SocketAd
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_tcp_stream() {
     let (echo, _eh) = echo_tcp().await;
-    let (_server, quic_addr) = spawn_quic(base_config()).await;
+    let (_server, quic_addr, _fp) = spawn_quic(base_config()).await;
     let mut t = hydr_transport::Tunnel::Quic(connect_quic(quic_addr).await);
     echo_via_tunnel(&mut t, echo, "quic-tcp").await;
 }
@@ -149,7 +150,7 @@ async fn ws_tcp_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_udp_datagram() {
     let (echo, _eh) = echo_udp().await;
-    let (_server, quic_addr) = spawn_quic(base_config()).await;
+    let (_server, quic_addr, _fp) = spawn_quic(base_config()).await;
     let mut t = hydr_transport::Tunnel::Quic(connect_quic(quic_addr).await);
     echo_udp_via_tunnel(&mut t, echo, "quic-udp").await;
 }
@@ -164,7 +165,7 @@ async fn ws_udp_datagram() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_failure_rejected() {
-    let (_server, quic_addr) = spawn_quic(base_config()).await;
+    let (_server, quic_addr, _fp) = spawn_quic(base_config()).await;
     let bad = AuthRequest::new_password(b"wrong", 0, FEATURE_UDP);
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut got_err = false;
@@ -193,7 +194,7 @@ fn fixed_auth(nonce: &[u8; NONCE_LEN], password: &[u8], features: u8) -> AuthReq
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_detected_on_second_auth_quic() {
-    let (_server, quic_addr) = spawn_quic(base_config()).await;
+    let (_server, quic_addr, _fp) = spawn_quic(base_config()).await;
     let nonce = [0xABu8; NONCE_LEN];
     let req = fixed_auth(&nonce, PASSWORD.as_bytes(), FEATURE_UDP);
     assert!(
@@ -237,7 +238,7 @@ async fn replay_detected_on_second_auth_ws() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn many_concurrent_streams_one_tunnel() {
     let (echo, _eh) = echo_tcp().await;
-    let (_server, quic_addr) = spawn_quic(base_config()).await;
+    let (_server, quic_addr, _fp) = spawn_quic(base_config()).await;
     let t = hydr_transport::Tunnel::Quic(connect_quic(quic_addr).await);
     let handle = hydr_transport::TunnelHandle::from_tunnel(&t);
     let addr = Address::Ip(echo.ip(), echo.port());
@@ -269,7 +270,7 @@ async fn multi_hop_quic() {
     let (echo, _eh) = echo_tcp().await;
     let (echo_udp, _uh) = echo_udp().await;
 
-    let (_target, target_addr) = spawn_quic(base_config()).await;
+    let (_target, target_addr, _fp) = spawn_quic(base_config()).await;
     let mut front_cfg = base_config();
     front_cfg.next_hop = Some(NextHop {
         password: PASSWORD.into(),
@@ -277,9 +278,10 @@ async fn multi_hop_quic() {
             addr: target_addr,
             server_name: "localhost".into(),
             insecure: true,
+            fingerprint: None,
         },
     });
-    let (_front, front_addr) = spawn_quic(front_cfg).await;
+    let (_front, front_addr, _fp) = spawn_quic(front_cfg).await;
     let mut t = hydr_transport::Tunnel::Quic(connect_quic(front_addr).await);
     echo_via_tunnel(&mut t, echo, "multi-hop-quic-tcp").await;
     echo_udp_via_tunnel(&mut t, echo_udp, "multi-hop-quic-udp").await;
@@ -289,7 +291,7 @@ async fn multi_hop_quic() {
 async fn multi_hop_ws() {
     let (echo, _eh) = echo_tcp().await;
 
-    let (_target, target_addr) = spawn_quic(base_config()).await;
+    let (_target, target_addr, _fp) = spawn_quic(base_config()).await;
     let mut front_cfg = base_config();
     front_cfg.next_hop = Some(NextHop {
         password: PASSWORD.into(),
@@ -297,6 +299,7 @@ async fn multi_hop_ws() {
             addr: target_addr,
             server_name: "localhost".into(),
             insecure: true,
+            fingerprint: None,
         },
     });
     let (_front, url) = spawn_ws(front_cfg).await;
@@ -364,7 +367,7 @@ async fn ws_obfuscation_key_mismatch_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_connect_refused_returns_error() {
-    let (_server, quic_addr) = spawn_quic(base_config()).await;
+    let (_server, quic_addr, _fp) = spawn_quic(base_config()).await;
     let t = hydr_transport::Tunnel::Quic(connect_quic(quic_addr).await);
     let handle = hydr_transport::TunnelHandle::from_tunnel(&t);
     // порт 1 на loopback гарантированно закрыт
@@ -377,7 +380,7 @@ async fn stream_connect_refused_returns_error() {
 async fn max_conns_rejects_extra_tunnels() {
     let mut cfg = base_config();
     cfg.max_conns = 1;
-    let (server, quic_addr) = spawn_quic(cfg).await;
+    let (server, quic_addr, _fp) = spawn_quic(cfg).await;
     // первый туннель занимает единственный слот
     let _first = connect_quic(quic_addr).await;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -391,4 +394,29 @@ async fn max_conns_rejects_extra_tunnels() {
     }
     assert!(rejected, "второй туннель при max_conns=1 должен быть отклонён");
     drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cert_pinning_accepts_correct_fingerprint() {
+    let (_server, quic_addr, fp) = spawn_quic(base_config()).await;
+    let t = quic::connect_with_tls(quic_addr, "localhost", false, Some(fp), None, &auth())
+        .await
+        .expect("connect with correct pin must succeed");
+    drop(t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cert_pinning_rejects_wrong_fingerprint() {
+    let (_server, quic_addr, _fp) = spawn_quic(base_config()).await;
+    let mut wrong = [0u8; 32];
+    wrong[0] = 0xAA;
+    for _ in 0..5 {
+        if quic::connect_with_tls(quic_addr, "localhost", false, Some(wrong), None, &auth())
+            .await
+            .is_ok()
+        {
+            panic!("connect with wrong pin must not succeed");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

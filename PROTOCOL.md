@@ -152,6 +152,17 @@ Unfragmented packets set `frag_count = 1`.
 - TCP: one bidirectional QUIC stream per proxy connection.
 - UDP: QUIC datagrams carrying `Datagram` messages.
 
+### TLS identity (both transports)
+
+Servers typically use self-signed certificates. A server MAY persist its
+certificate and key to PEM files; otherwise a fresh certificate is generated
+per start and the fingerprint changes. The server SHOULD log the SHA-256
+fingerprint of its certificate at startup. Clients SHOULD verify the connection
+by pinning this fingerprint; as an alternative to PKI verification the client
+compares the SHA-256 digest of the server's DER certificate against the pinned
+value and aborts the handshake on mismatch. Clients MUST NOT disable
+verification (`insecure`) in production deployments.
+
 ### WebSocket
 
 - Transport: RFC 6455 over TLS (or plain TCP, configurable).
@@ -175,10 +186,23 @@ types:
   0x08 AuthRequest      body = AuthRequest
   0x09 AuthResponse     body = AuthResponse
   0x0a SessionClose
+  0x0b StreamCredit     body = varint (bytes freed by the receiver)
 ```
 
 Stream id `0` is the control channel. `StreamData`/`StreamClose` frames are
 dispatched to the stream matching `stream_id`.
+
+### WebSocket flow control
+
+Because WS provides no per-stream backpressure, hydr adds a credit window per
+stream (similar to HTTP/2 / QUIC STREAM flow control). The receiver of a stream
+tracks bytes consumed by the application and periodically sends
+`StreamCredit(stream_id, amount)`. The sender counts outstanding (uncredited)
+bytes and pauses that stream's data once they reach the receive window
+(implementation: 512 KiB, credits returned in ≥256 KiB batches). Waiting
+happens in the sender's per-stream task, so a stalled stream never blocks other
+streams or control frames. Peers that do not implement `0x0b` simply ignore it;
+senders MUST NOT rely on credits from such peers.
 
 ## Session Multiplexing (MUX)
 

@@ -252,7 +252,20 @@ pub async fn connect(
     transport: Option<quinn::TransportConfig>,
     auth: &AuthRequest,
 ) -> Result<QuicTunnel> {
-    let rustls_cfg = tls::make_client_config(insecure);
+    connect_with_tls(addr, server_name, insecure, None, transport, auth).await
+}
+
+/// Как `connect`, но с опциональным пином SHA-256 сертификата сервера:
+/// надёжная защита от MITM без PKI (self-signed режим).
+pub async fn connect_with_tls(
+    addr: SocketAddr,
+    server_name: &str,
+    insecure: bool,
+    cert_pin: Option<[u8; 32]>,
+    transport: Option<quinn::TransportConfig>,
+    auth: &AuthRequest,
+) -> Result<QuicTunnel> {
+    let rustls_cfg = tls::make_client_config_with_pin(insecure, cert_pin);
     let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
         .map_err(to_io_error)?;
     let mut quinn_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));

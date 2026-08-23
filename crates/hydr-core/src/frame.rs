@@ -11,6 +11,10 @@ pub const FRAME_PONG: u8 = 0x07;
 pub const FRAME_AUTH_REQUEST: u8 = 0x08;
 pub const FRAME_AUTH_RESPONSE: u8 = 0x09;
 pub const FRAME_SESSION_CLOSE: u8 = 0x0a;
+/// WS flow control: тело — varint, сколько байт стрима получатель освободил.
+/// Старые пировые реализации игнорируют неизвестные типы кадров (`_ => {}`),
+/// поэтому кадр аддитивен.
+pub const FRAME_STREAM_CREDIT: u8 = 0x0b;
 
 pub const CONTROL_STREAM: u64 = 0;
 
@@ -53,23 +57,31 @@ impl Frame {
         let (body_len, used2) = crate::varint::decode_varint(&buf[pos..])?;
         pos += used2;
         let body_len = body_len as usize;
-        if buf.len() < pos + body_len {
+        if body_len > MAX_BODY_LEN {
+            return Err(Error::InvalidData("frame body too large"));
+        }
+        let end = pos.checked_add(body_len).ok_or(Error::InvalidData("frame length overflow"))?;
+        if buf.len() < end {
             return Err(Error::UnexpectedEof);
         }
-        let body = buf[pos..pos + body_len].to_vec();
+        let body = buf[pos..end].to_vec();
         Ok((
             Frame {
                 stream_id,
                 frame_type,
                 body,
             },
-            pos + body_len,
+            end,
         ))
     }
 }
 
+/// Максимальный размер тела фрейма; навязывается декодером как защита от
+/// DoS через объявленную длину.
+pub const MAX_BODY_LEN: usize = 64 * 1024;
+
 pub fn max_frame_len() -> usize {
-    MAX_VARINT + 1 + MAX_VARINT + 64 * 1024
+    MAX_VARINT + 1 + MAX_VARINT + MAX_BODY_LEN
 }
 
 #[cfg(test)]
@@ -130,5 +142,39 @@ mod tests {
     fn max_frame_len_is_reasonable() {
         // не должно быть бесконечным; 64KiB тела + заголовки
         assert!(max_frame_len() < 100 * 1024);
+    }
+
+    #[test]
+    fn oversized_body_is_rejected() {
+        // заголовок объявляет body_len = MAX_BODY_LEN + 1
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 1);
+        buf.push(FRAME_STREAM_DATA);
+        encode_varint(&mut buf, (MAX_BODY_LEN + 1) as u64);
+        buf.extend_from_slice(&[0u8; 128]);
+        assert!(Frame::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn huge_body_len_is_invalid_not_eof() {
+        // varint u64::MAX — переполнение/гигантская длина → InvalidData, не паника
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 1);
+        buf.push(FRAME_STREAM_DATA);
+        encode_varint(&mut buf, u64::MAX);
+        assert!(matches!(
+            Frame::decode(&buf),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn max_allowed_body_still_decodes() {
+        let f = Frame::data(1, vec![7u8; MAX_BODY_LEN]);
+        let mut buf = Vec::new();
+        f.encode(&mut buf);
+        let (d, used) = Frame::decode(&buf).unwrap();
+        assert_eq!(d.body.len(), MAX_BODY_LEN);
+        assert_eq!(used, buf.len());
     }
 }

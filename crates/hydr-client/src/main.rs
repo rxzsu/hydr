@@ -20,19 +20,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             addr,
             server_name,
             insecure,
+            fingerprint,
         } => ClientTransport::Quic {
             addr: addr.parse()?,
             server_name,
             insecure,
+            fingerprint,
         },
         cli::TransportFile::Ws {
             url,
             insecure,
             obfuscation,
+            fingerprint,
         } => ClientTransport::Ws {
             url,
             insecure,
             obfuscation,
+            fingerprint,
         },
     };
 

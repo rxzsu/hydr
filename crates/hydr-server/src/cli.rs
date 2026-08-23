@@ -39,6 +39,11 @@ pub struct ServerFile {
 pub struct QuicFile {
     pub bind: String,
     pub server_name: String,
+    /// PEM-сертификат (задаётся вместе с key); без пары — ephemeral self-signed
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +68,9 @@ pub enum HopTransportFile {
         server_name: String,
         #[serde(default)]
         insecure: bool,
+        /// SHA-256 fingerprint сертификата следующего узла (hex).
+        #[serde(default)]
+        fingerprint: Option<String>,
     },
     Ws {
         url: String,
@@ -70,6 +78,8 @@ pub enum HopTransportFile {
         insecure: bool,
         #[serde(default)]
         obfuscation: Option<String>,
+        #[serde(default)]
+        fingerprint: Option<String>,
     },
 }
 

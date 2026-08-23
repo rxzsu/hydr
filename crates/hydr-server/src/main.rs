@@ -21,6 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(QuicListen {
                 bind: q.bind.parse()?,
                 server_name: q.server_name,
+                cert: q.cert,
+                key: q.key,
             })
         })
         .transpose()?;
@@ -42,19 +44,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     addr,
                     server_name,
                     insecure,
+                    fingerprint,
                 } => NextHopTransport::Quic {
                     addr: addr.parse()?,
                     server_name,
                     insecure,
+                    fingerprint,
                 },
                 cli::HopTransportFile::Ws {
                     url,
                     insecure,
                     obfuscation,
+                    fingerprint,
                 } => NextHopTransport::Ws {
                     url,
                     insecure,
                     obfuscation,
+                    fingerprint,
                 },
             };
             Ok(NextHop {

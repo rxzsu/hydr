@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hydr_core::message::{
     AuthRequest, AuthResponse, Datagram, FEATURE_UDP, STATUS_OK,
@@ -102,6 +102,53 @@ async fn spawn_ws_server() -> SocketAddr {
                     };
                 let mut t: Tunnel = Tunnel::Ws(tunnel);
                 echo_loop(&mut t).await;
+            });
+        }
+    });
+    local
+}
+
+/// Как `spawn_ws_server`, но каждый принятый стрим эхоится в отдельной таске:
+/// медленный стрим не блокирует приём остальных на уровне приложения.
+async fn spawn_ws_server_concurrent_echo() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let val = validator();
+            tokio::spawn(async move {
+                let (tunnel, _req) = match ws::accept(tcp, "/hydr", val).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut t: Tunnel = Tunnel::Ws(tunnel);
+                loop {
+                    match t.next_event().await {
+                        Ok(ServerEvent::Stream(acc)) => {
+                            tokio::spawn(async move {
+                                let mut acc = acc;
+                                acc.reply(STATUS_OK, b"").await.ok();
+                                let mut relay = acc.into_relay();
+                                let mut buf = [0u8; 4096];
+                                loop {
+                                    let n = relay.read(&mut buf).await.unwrap_or(0);
+                                    if n == 0 || relay.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                        Ok(ServerEvent::Datagram(dg)) => {
+                            let _ = t.send_datagram(&dg);
+                        }
+                        Err(_) => break,
+                    }
+                }
             });
         }
     });
@@ -250,6 +297,78 @@ async fn ws_obfuscation_key_mismatch_rejected() {
     let client_key = Arc::new(hydr_core::obfuscation::Obfuscator::new(b"client-key"));
     let res = ws::connect_with_obfuscation(&url, false, &test_auth(), Some(client_key)).await;
     assert!(res.is_err(), "mismatched obfuscation keys must fail");
+}
+
+/// Регресс-тест backpressure: stalled-стрим (пишем и не читаем) не должен
+/// мешать здоровым стримам проходить через то же WS-соединение.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_slow_stream_does_not_starve_others() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = spawn_ws_server_concurrent_echo().await;
+    let url = format!("ws://{addr}/hydr");
+    let tunnel = ws::connect(&url, false, &test_auth()).await.unwrap();
+
+    let mut stalled = tunnel
+        .open_stream(&Address::Domain("stall.test".into(), 80))
+        .await
+        .unwrap();
+    // пишем заметно больше суммарного буфера и никогда не читаем ответ:
+    // пер-стрименная очередь упирается в лимит, стрим "замирает"
+    let writer = tokio::spawn(async move {
+        let chunk = vec![0u8; 32 * 1024];
+        for _ in 0..64 {
+            if stalled.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+        let _ = stalled.shutdown().await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut healthy = tunnel
+        .open_stream(&Address::Domain("echo.test".into(), 80))
+        .await
+        .unwrap();
+    let payload = vec![7u8; 256 * 1024];
+    let payload_len = payload.len();
+    let echoed = tokio::time::timeout(Duration::from_secs(20), async move {
+        healthy.write_all(&payload).await.unwrap();
+        // half-close: без него серверное эхо не закроет поток и EOF не придёт
+        healthy.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        healthy.read_to_end(&mut echoed).await.unwrap();
+        echoed
+    })
+    .await
+    .expect("healthy stream must complete while another one is stalled");
+    assert_eq!(echoed.len(), payload_len);
+
+    drop(writer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_send_datagram_after_close_errors() {
+    let addr = spawn_ws_server().await;
+    let url = format!("ws://{addr}/hydr");
+    let tunnel = ws::connect(&url, false, &test_auth()).await.unwrap();
+    let handle = tunnel.handle();
+    handle.close().unwrap();
+    let dg = Datagram::new(
+        1,
+        Address::Ip("1.1.1.1".parse().unwrap(), 53),
+        b"x".to_vec(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if handle.send_datagram(&dg).is_err() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "send_datagram on closed tunnel must eventually return an error"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn quic_tunnel() -> hydr_transport::Tunnel {
