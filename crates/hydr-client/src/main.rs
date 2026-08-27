@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let file = cli::load(&args.config)?;
 
+    let password = file.resolve_password()?;
     let transport = match file.transport {
         cli::TransportFile::Quic {
             addr,
@@ -39,10 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fingerprint,
         },
     };
-
     let client = Client::connect(ClientConfig {
         transport,
-        password: file.password,
+        password,
         cc_rx: file.cc_rx.unwrap_or(0),
         socks5_bind: file.socks5_bind.parse()?,
     })

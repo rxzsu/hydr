@@ -79,7 +79,31 @@ fn write_pem(path: &Path, tag: &str, der: &[u8]) -> std::io::Result<()> {
         pem.push('\n');
     }
     pem.push_str(&format!("-----END {tag}-----\n"));
-    std::fs::write(path, pem)
+    // атомарная запись: tmp + rename, файл 0o600 (приватный ключ)
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        f.write_all(pem.as_bytes())?;
+        f.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// SHA-256 fingerprint сертификата (DER), нижний регистр hex.

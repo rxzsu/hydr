@@ -1,0 +1,7 @@
+[toolchain]
+# Актуальный тулчейн для разработки — 1.98.0 (stable на 2026-08-28).
+# MSRV проекта — 1.95.0, задаётся в Cargo.toml:workspace.package.rust-version.
+# `rustup` на локальной машине подхватит stable (1.98.0); CI проверяет обе версии.
+channel = "stable"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

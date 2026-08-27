@@ -182,8 +182,19 @@ impl Client {
             let dg = match recv {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("tunnel closed ({e}), reconnecting in {}ms", backoff.as_millis());
-                    tokio::time::sleep(backoff).await;
+                    // jitter 0.8..1.2 чтобы не было thundering herd после рестарта сервера
+                    let jittered = {
+                        let mut b = [0u8; 1];
+                        let _ = getrandom::fill(&mut b);
+                        let factor = 0.8 + (b[0] as f64 / 255.0) * 0.4;
+                        Duration::from_millis((backoff.as_millis() as f64 * factor) as u64)
+                    };
+                    tracing::warn!(
+                        "tunnel closed ({e}), reconnecting in {}ms (base {}ms)",
+                        jittered.as_millis(),
+                        backoff.as_millis()
+                    );
+                    tokio::time::sleep(jittered).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                     match self.reconnect().await {
                         Ok(()) => {

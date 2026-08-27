@@ -4,7 +4,18 @@ description = "Wire format and protocol messages for the hydr proxy protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Опциональный Protobuf-IDL для control-plane (администрирование/статус).
+# Data-plane (Frame/Message) остаётся рукописным для 0-overhead и анти-DPI.
+proto = ["dep:prost", "dep:prost-build"]
 
 [dependencies]
 blake3 = "1"
-getrandom = "0.2"
+getrandom = "0.4"
+prost = { version = "0.14", optional = true }
+
+[build-dependencies]
+prost-build = { version = "0.14", optional = true }

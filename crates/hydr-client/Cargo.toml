@@ -3,6 +3,7 @@ name = "hydr-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -12,6 +13,7 @@ hydr-transport = { version = "0.1.0", path = "../hydr-transport" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { version = "1.53.1", features = ["full"] }
+getrandom = "0.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

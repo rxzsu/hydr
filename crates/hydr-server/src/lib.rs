@@ -89,11 +89,14 @@ pub struct Server {
 /// запись. Раньше кэш сбрасывался целиком — флуд случайными nonce вымывал
 /// легитимные записи и открывал окно для replay.
 const REPLAY_CACHE_MAX: usize = 8192;
+/// Время жизни nonce в кэше — replay-окно. После TTL запись вытесняется даже
+/// если кэш не переполнен.
+const REPLAY_TTL: Duration = Duration::from_secs(600);
 
-/// Bounded FIFO-кэш nonce: O(1) вставка и вытеснение старейшей записи.
+/// Bounded FIFO-кэш nonce с TTL: O(1) вставка и вытеснение старейшей записи.
 struct NonceCache {
     set: HashSet<Vec<u8>>,
-    order: VecDeque<Vec<u8>>,
+    order: VecDeque<(Vec<u8>, Instant)>,
     cap: usize,
 }
 
@@ -106,16 +109,29 @@ impl NonceCache {
         }
     }
 
+    fn evict_expired(&mut self, now: Instant) {
+        while let Some((_, t)) = self.order.front() {
+            if now.duration_since(*t) < REPLAY_TTL {
+                break;
+            }
+            if let Some((old, _)) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+
     /// Отмечает nonce как использованный; `false` — уже был (replay).
     fn insert(&mut self, nonce: &[u8]) -> bool {
+        let now = Instant::now();
+        self.evict_expired(now);
         if self.set.contains(nonce) {
             return false;
         }
         let key = nonce.to_vec();
         self.set.insert(key.clone());
-        self.order.push_back(key);
+        self.order.push_back((key, now));
         while self.order.len() > self.cap {
-            if let Some(old) = self.order.pop_front() {
+            if let Some((old, _)) = self.order.pop_front() {
                 self.set.remove(&old);
             }
         }
@@ -581,5 +597,16 @@ mod tests {
         assert!(c.insert(b"nonce-5"));
         assert_eq!(c.set.len(), c.order.len());
         assert!(c.order.len() <= 4);
+    }
+
+    #[test]
+    fn nonce_cache_ttl_expires() {
+        let mut c = NonceCache::new(8);
+        assert!(c.insert(b"ttl-nonce"));
+        // состарим запись вручную
+        c.order[0].1 = Instant::now() - REPLAY_TTL - Duration::from_secs(1);
+        assert!(c.insert(b"other"));
+        // ttl-nonce должна была вытесниться по TTL, повтор — уже не replay
+        assert!(c.insert(b"ttl-nonce"), "expired nonce must be re-accepted");
     }
 }

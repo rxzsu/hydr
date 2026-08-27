@@ -20,13 +20,55 @@ pub struct Args {
 
 #[derive(Debug, Deserialize)]
 pub struct ClientFile {
-    pub password: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub password_file: Option<String>,
     /// Целевая полоса передачи в бит/с (0 — дефолтный congestion control)
     #[serde(default)]
     pub cc_rx: Option<u64>,
     /// Локальный SOCKS5 адрес (например 127.0.0.1:1080)
     pub socks5_bind: String,
     pub transport: TransportFile,
+}
+
+impl ClientFile {
+    pub fn resolve_password(&self) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(p) = &self.password_file {
+            let path = PathBuf::from(p);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let meta = std::fs::metadata(&path)?;
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    return Err(format!(
+                        "password_file {p} has overly permissive mode {mode:o} (expected 600 or 400)"
+                    )
+                    .into());
+                }
+            }
+            let s = std::fs::read_to_string(&path)?;
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                return Err("password_file is empty".into());
+            }
+            return Ok(s);
+        }
+        if let Ok(env) = std::env::var("HYDR_PASSWORD") {
+            let env = env.trim().to_string();
+            if !env.is_empty() {
+                return Ok(env);
+            }
+        }
+        self.password
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "password not set: use `password`, `password_file` or env HYDR_PASSWORD".into()
+            })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +96,19 @@ pub enum TransportFile {
 }
 
 pub fn load(path: &PathBuf) -> Result<ClientFile, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "config file {} has permissive mode {mode:o} — consider 600",
+                    path.display()
+                );
+            }
+        }
+    }
     let text = std::fs::read_to_string(path)?;
     Ok(serde_yaml::from_str(&text)?)
 }

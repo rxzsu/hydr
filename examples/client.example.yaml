@@ -1,5 +1,8 @@
-# hydr-client example config
-password: "change-me"
+# hydr-client example config — see SECURITY.md
+# Рекомендуется: password_file или env HYDR_PASSWORD (файл 0o600).
+# password: "change-me-32-bytes-random-please"  # deprecated: inline
+# password_file: "/etc/hydr/password"
+password: "change-me-32-bytes-random-please"
 
 # target send rate in bits/s (0 = default congestion control)
 cc_rx: 0
@@ -11,14 +14,13 @@ transport:
   type: quic
   addr: "1.2.3.4:8443"
   server_name: "example.com"
-  # SHA-256 fingerprint of the server certificate (hex, 64 chars).
-  # The server prints it on startup. Prefer this over insecure: true —
-  # it protects against MITM without a public CA.
+  # SECURITY: pin the server's SHA-256 fingerprint instead of insecure:true.
+  # The server prints it on startup: "QUIC certificate fingerprint (sha256): ..."
+  fingerprint: "a1b2c3...64-hex-chars"
+  insecure: false
+  # alternative: ws
+  # type: ws
+  # url: "wss://example.com/hydr"
+  # insecure: false
+  # obfuscation: "my-secret-key-32-bytes"
   # fingerprint: "a1b2c3...64-hex-chars"
-  insecure: true
-# or WebSocket:
-#   type: ws
-#   url: "wss://example.com/hydr"
-#   insecure: false
-#   obfuscation: "my-secret-key"
-#   fingerprint: "a1b2c3...64-hex-chars"

@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package hydr;
+
+// Control-plane IDL (опционально, feature `proto`). НЕ data-plane: туннельный
+// трафик кодируется рукописным Frame/Message для 0-overhead и отсутствия
+// сигнатур Protobuf в wire. Здесь — только административный/статусный протокол.
+
+// Запрос статуса от админ-клиента к серверу.
+message StatusRequest {
+  uint64 nonce = 1;
+}
+
+// Ответ сервера с агрегированной телеметрией.
+message StatusResponse {
+  uint64 nonce = 1;
+  uint64 uptime_secs = 2;
+  uint64 active_sessions = 3;
+  uint64 bytes_in = 4;
+  uint64 bytes_out = 5;
+}
+
+// Административная команда (restart, reload, ban и т.п.).
+message AdminCommand {
+  string command = 1;
+  repeated string args = 2;
+}
+
+message AdminResponse {
+  bool ok = 1;
+  string message = 2;
+}

@@ -1,5 +1,9 @@
-# hydr-server example config
-password: "change-me"
+# hydr-server example config — see SECURITY.md
+# Пароль: используйте `password_file` или env HYDR_PASSWORD (файл 0o600).
+# Пример с env: HYDR_PASSWORD="change-me-32-bytes-random" hydr-server -c server.yaml
+# password: "change-me-32-bytes-random-please"  # deprecated: храните в файле/env
+# password_file: "/etc/hydr/password"  # файл 0o600, одна строка
+password: "change-me-32-bytes-random-please"
 
 # target receive rate in bits/s (0 = default congestion control)
 cc_rx: 0
@@ -13,14 +17,14 @@ quic:
   # optional PEM cert/key pair: keeps the certificate (and its fingerprint,
   # which clients pin) stable across restarts; without them a fresh
   # self-signed certificate is generated on every start and printed to the log
-  # cert: "/etc/hydr/cert.pem"
-  # key: "/etc/hydr/key.pem"
+  # cert: "/etc/hydr/cert.pem"  # 0o600
+  # key: "/etc/hydr/key.pem"    # 0o600
 
 ws:
   bind: "0.0.0.0:8080"
   path: "/hydr"
   # optional obfuscation key (must match client)
-  # obfuscation: "my-secret-key"
+  # obfuscation: "my-secret-key-32-bytes"
 
 # optional multi-hop relay
 # next_hop:
@@ -29,10 +33,12 @@ ws:
 #     type: quic
 #     addr: "2.2.2.2:8443"
 #     server_name: "hop.example.com"
-#     insecure: true
-#     # fingerprint: "<sha256 of the hop certificate, hex>"
+#     # SECURITY: never use insecure:true in production — pin the hop's cert:
+#     insecure: false
+#     fingerprint: "a1b2c3...64-hex-chars-sha256-of-hop-cert"
 #   # or:
 #   # type: ws
 #   # url: "wss://hop.example.com/hydr"
 #   # insecure: false
+#   # fingerprint: "a1b2c3...64-hex-chars"
 #   # obfuscation: "my-secret-key"

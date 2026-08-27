@@ -23,9 +23,12 @@ pub const NONCE_LEN: usize = 16;
 /// Длина тега целостности в обфускаторе.
 pub const TAG_LEN: usize = 16;
 
-/// Производит 32-байтный ключ из пароля (для keyed-hash доказательства).
+/// Производит 32-байтный ключ из пароля через доменный KDF.
+/// Используется `blake3::derive_key` с контекстом `hydr v1 auth proof` — защита
+/// от cross-protocol reuse и чуть сильнее простого `hash(password)` (требуйте
+/// всё равно пароль ≥32 байта энтропии, см. SECURITY.md).
 fn derive_key(password: &[u8]) -> [u8; 32] {
-    *blake3::hash(password).as_bytes()
+    blake3::derive_key("hydr v1 auth proof", password)
 }
 
 /// Доказательство владения паролем: keyed_hash(password, nonce).
@@ -67,8 +70,43 @@ impl AuthRequest {
     /// Строит запрос с доказательством владения паролем.
     /// `client_nonce` генерируется случайно (защита от replay и утечки пароля).
     pub fn new_password(password: &[u8], cc_rx: u64, features: u8) -> Self {
+        Self::new_password_with_nonce(password, cc_rx, features, None)
+    }
+
+    /// Вариант `new_password`, возвращающий `Result` вместо паники при недоступности CSPRNG.
+    pub fn try_new_password(
+        password: &[u8],
+        cc_rx: u64,
+        features: u8,
+    ) -> crate::error::Result<Self> {
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce).expect("CSPRNG unavailable");
+        getrandom::fill(&mut nonce).map_err(|e| {
+            crate::error::Error::Io(std::io::Error::other(format!(
+                "CSPRNG unavailable: {e}"
+            )))
+        })?;
+        let proof = compute_auth_proof(password, &nonce);
+        Ok(Self {
+            version: PROTOCOL_VERSION,
+            auth_method: Self::AUTH_PASSWORD,
+            client_nonce: nonce.to_vec(),
+            auth_proof: proof,
+            cc_rx,
+            features,
+            padding: Vec::new(),
+        })
+    }
+
+    fn new_password_with_nonce(
+        password: &[u8],
+        cc_rx: u64,
+        features: u8,
+        nonce_override: Option<[u8; NONCE_LEN]>,
+    ) -> Self {
+        let mut nonce = nonce_override.unwrap_or([0u8; NONCE_LEN]);
+        if nonce_override.is_none() {
+            getrandom::fill(&mut nonce).expect("CSPRNG unavailable");
+        }
         let proof = compute_auth_proof(password, &nonce);
         Self {
             version: PROTOCOL_VERSION,

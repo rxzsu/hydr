@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let file = cli::load(&args.config)?;
 
+    let password = file.resolve_password()?;
     let quic = file
         .quic
         .map(|q| -> Result<QuicListen, Box<dyn std::error::Error>> {
@@ -69,9 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         })
         .transpose()?;
-
     let config = ServerConfig {
-        password: file.password,
+        password,
         cc_rx: file.cc_rx.unwrap_or(0),
         quic,
         ws,

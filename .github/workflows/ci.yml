@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+      - run: cargo test -p hydr-core --features proto
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --all -- --check
+      - run: cargo install cargo-audit --locked || true
+      - run: cargo audit || true
+      - run: cargo install cargo-deny --locked || true
+      - run: cargo deny check || true
+
+  # Опциональный Protobuf-IDL (feature `proto`) требует бинарь `protoc`.
+  proto:
+    name: proto feature (protoc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo build -p hydr-core --features proto
+      - run: cargo test -p hydr-core --features proto
+
+  msrv:
+    name: MSRV 1.95.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - run: cargo check --workspace
+
+  # Best-effort: не падает CI при недоступности сети до crates.io.
+  outdated:
+    name: cargo outdated (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+      - run: cargo install cargo-outdated --locked || true
+      - run: cargo outdated -d 1 || true

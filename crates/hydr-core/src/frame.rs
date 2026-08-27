@@ -177,4 +177,27 @@ mod tests {
         assert_eq!(d.body.len(), MAX_BODY_LEN);
         assert_eq!(used, buf.len());
     }
+
+    #[test]
+    fn fuzz_random_bytes_never_panics() {
+        // fuzz-подобный тест: случайные байты не должны паниковать, только Err
+        for seed in 0..512u64 {
+            // детерминированный PRNG на blake3 для воспроизводимости
+            let mut h = blake3::hash(&seed.to_le_bytes());
+            let bytes: Vec<u8> = (0..64)
+                .map(|_| {
+                    h = blake3::hash(h.as_bytes());
+                    h.as_bytes()[0]
+                })
+                .collect();
+            let _ = Frame::decode(&bytes);
+            let _ = Frame::decode(&bytes[..bytes.len() / 2]);
+            let _ = Frame::decode(&[0u8; 0]);
+            let _ = Frame::decode(&[0xffu8; 128]);
+            let _ = crate::varint::decode_varint(&bytes);
+            let _ = crate::address::Address::decode(&bytes);
+            let _ = crate::message::AuthRequest::decode(&bytes);
+            let _ = crate::message::Datagram::decode(&bytes);
+        }
+    }
 }

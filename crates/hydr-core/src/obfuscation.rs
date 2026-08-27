@@ -88,11 +88,12 @@ impl Obfuscator {
         let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
         let mut plaintext = seq.to_be_bytes().to_vec();
         plaintext.extend_from_slice(buf);
-        let salt: Vec<u8> = (0..SALT_LEN).map(|_| rand_byte()).collect();
+        let mut salt = [0u8; SALT_LEN];
+        getrandom::fill(&mut salt).expect("CSPRNG unavailable for obfuscation salt");
         let mut body = plaintext;
         self.xor_in_place(&mut body, &salt);
         let tag = self.tag(&body);
-        let mut out = salt;
+        let mut out = salt.to_vec();
         out.extend_from_slice(&body);
         out.extend_from_slice(&tag);
         *buf = out;
@@ -148,14 +149,7 @@ impl Obfuscator {
     }
 }
 
-fn rand_byte() -> u8 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    ((t ^ (t >> 16)) as u8) ^ (t >> 8) as u8
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -265,5 +259,52 @@ mod tests {
         assert!(f.observe(5000));
         // очень старый за пределами окна отвергается (floor = 5000-1024)
         assert!(!f.observe(10));
+    }
+
+    #[test]
+    fn replay_filter_chaos_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+        let f = Arc::new(ReplayFilter::new(4096));
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let f = f.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..1000u64 {
+                    let seq = t * 1000 + i;
+                    assert!(f.observe(seq), "seq {seq} first observe must succeed");
+                    assert!(!f.observe(seq), "seq {seq} duplicate must fail");
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        // дубликаты после параллели всё ещё отвергаются
+        assert!(!f.observe(0));
+        assert!(!f.observe(3999));
+        // новый seq принимается
+        assert!(f.observe(10000));
+    }
+
+    #[test]
+    fn fuzz_obfuscation_random_payloads() {
+        let ob = Obfuscator::new(b"fuzz-key");
+        for len in [0, 1, 31, 32, 33, 128, 1024, 4096] {
+            for seed in 0..16u64 {
+                let mut payload: Vec<u8> = (0..len).map(|i| (seed.wrapping_add(i as u64) as u8).wrapping_mul(7)).collect();
+                let orig = payload.clone();
+                ob.encrypt(&mut payload);
+                let dec = ob.decrypt(&payload).expect("decrypt must succeed");
+                assert_eq!(dec, orig, "roundtrip len={len} seed={seed}");
+                // мусор не должен паниковать; мутируем тело (не соль — соль не покрыта MAC
+                // и мутация соли могла бы продвинуть replay-window)
+                let mut garbage = payload.clone();
+                if garbage.len() > SALT_LEN {
+                    garbage[SALT_LEN] ^= 0xff;
+                }
+                let _ = ob.decrypt(&garbage);
+                let _ = ob.decrypt(&[0u8; 0]);
+                let _ = ob.decrypt(&payload[..payload.len().saturating_sub(1)]);
+            }
+        }
     }
 }

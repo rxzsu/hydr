@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 
+/// Счётчик дропов датаграмм из-за переполнения WS очереди (мониторинг перегрузки).
+pub static WS_DATAGRAM_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 use futures_util::{SinkExt, StreamExt};
 use hydr_core::frame::{
     Frame, FRAME_AUTH_REQUEST, FRAME_AUTH_RESPONSE, FRAME_DATAGRAM, FRAME_OPEN_STREAM,
@@ -149,6 +152,7 @@ impl WsHandle {
             // переполнение очереди — транзиентная перегрузка; для UDP честнее
             // тихо дропнуть пакет, чем убивать сессию
             Err(mpsc::error::TrySendError::Full(_)) => {
+                WS_DATAGRAM_DROPPED.fetch_add(1, Ordering::Relaxed);
                 trace!("ws outbound queue full; dropping datagram");
                 Ok(())
             }
