@@ -2,16 +2,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hydr_core::message::{AuthRequest, FEATURE_UDP};
 use hydr_core::Address;
-use hydr_transport::{quic, ws, DynStream, ProxyStream, Tunnel, TunnelHandle};
+use hydr_core::message::{AuthRequest, FEATURE_UDP};
+use hydr_transport::{DynStream, ProxyStream, Tunnel, TunnelHandle, quic, ws};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 mod socks5;
 mod udp_relay;
 
-pub use socks5::{parse_udp_packet, CMD_CONNECT, CMD_UDP_ASSOCIATE};
+pub use socks5::{CMD_CONNECT, CMD_UDP_ASSOCIATE, parse_udp_packet};
 pub use udp_relay::UdpRelay;
 
 pub struct ClientConfig {
@@ -81,7 +81,9 @@ impl Client {
             } => {
                 let pin = hydr_transport::tls::require_fingerprint(fingerprint.as_deref())?;
                 if *insecure && pin.is_some() {
-                    tracing::warn!("both `insecure` and `fingerprint` set; the pin takes precedence");
+                    tracing::warn!(
+                        "both `insecure` and `fingerprint` set; the pin takes precedence"
+                    );
                 }
                 let fut = quic::connect_with_tls(
                     *addr,
@@ -93,10 +95,17 @@ impl Client {
                 );
                 Ok(Tunnel::Quic(fut.await?))
             }
-            ClientTransport::Ws { url, insecure, obfuscation, fingerprint } => {
+            ClientTransport::Ws {
+                url,
+                insecure,
+                obfuscation,
+                fingerprint,
+            } => {
                 let pin = hydr_transport::tls::require_fingerprint(fingerprint.as_deref())?;
                 if *insecure && pin.is_some() {
-                    tracing::warn!("both `insecure` and `fingerprint` set; the pin takes precedence");
+                    tracing::warn!(
+                        "both `insecure` and `fingerprint` set; the pin takes precedence"
+                    );
                 }
                 let ob = obfuscation
                     .clone()
@@ -134,10 +143,7 @@ impl Client {
     }
 
     fn is_transport_error(e: &hydr_core::Error) -> bool {
-        matches!(
-            e,
-            hydr_core::Error::StreamClosed | hydr_core::Error::Io(_)
-        )
+        matches!(e, hydr_core::Error::StreamClosed | hydr_core::Error::Io(_))
     }
 
     /// Открывает поток с одним ретраем: транспортный сбой трактуется как смерть
@@ -274,9 +280,7 @@ impl Client {
                 let _ = tokio::io::copy_bidirectional(&mut tcp, &mut peer_stream).await;
                 Ok(())
             }
-            socks5::CMD_UDP_ASSOCIATE => {
-                self.udp.associate(tcp, peer).await
-            }
+            socks5::CMD_UDP_ASSOCIATE => self.udp.associate(tcp, peer).await,
             _ => {
                 tcp.write_all(&[5, 0x07, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
                 Err(hydr_core::Error::InvalidData("unsupported command"))

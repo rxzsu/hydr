@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use hydr_core::message::Datagram;
 use hydr_core::{Address, Result};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
-use crate::socks5::parse_udp_packet;
 use crate::TunnelHandle;
+use crate::socks5::parse_udp_packet;
 
 struct RelaySession {
     socket: Arc<UdpSocket>,
@@ -40,10 +40,13 @@ impl UdpRelay {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let local = socket.local_addr()?;
         let sid = self.next_session.fetch_add(1, Ordering::Relaxed);
-        self.sessions
-            .lock()
-            .await
-            .insert(sid, RelaySession { socket, client_addr: Mutex::new(None) });
+        self.sessions.lock().await.insert(
+            sid,
+            RelaySession {
+                socket,
+                client_addr: Mutex::new(None),
+            },
+        );
 
         let mut resp = vec![5, 0, 0];
         Address::Ip(local.ip(), local.port()).encode(&mut resp);

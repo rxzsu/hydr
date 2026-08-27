@@ -3,7 +3,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use hydr_core::message::{AuthRequest, AuthResponse, Datagram, OpenStream, OpenStreamAck, STATUS_ERR};
+use hydr_core::message::{
+    AuthRequest, AuthResponse, Datagram, OpenStream, OpenStreamAck, STATUS_ERR,
+};
 use hydr_core::{Address, Error, Result};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -46,7 +48,10 @@ impl QuicTunnel {
     pub async fn open_stream(&self, addr: &Address) -> Result<DynStream> {
         let (mut send, mut recv) = self.conn.open_bi().await.map_err(to_io_error)?;
         let mut buf = Vec::new();
-        OpenStream { address: addr.clone() }.encode(&mut buf);
+        OpenStream {
+            address: addr.clone(),
+        }
+        .encode(&mut buf);
         write_len_prefixed(&mut send, &buf).await?;
 
         let ack = read_message(&mut recv, OpenStreamAck::decode).await?;
@@ -63,9 +68,7 @@ impl QuicTunnel {
     pub fn send_datagram(&self, dg: &Datagram) -> Result<()> {
         let mut buf = Vec::new();
         dg.encode(&mut buf);
-        self.conn
-            .send_datagram(buf.into())
-            .map_err(to_io_error)
+        self.conn.send_datagram(buf.into()).map_err(to_io_error)
     }
 
     pub async fn recv_datagram(&self) -> Result<Datagram> {
@@ -135,19 +138,13 @@ impl AsyncWrite for QuicStream {
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.send)
             .poll_flush(cx)
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.send)
             .poll_shutdown(cx)
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
@@ -228,7 +225,9 @@ pub fn default_transport_config() -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.max_concurrent_bidi_streams(1024u32.into());
     cfg.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    cfg.max_idle_timeout(Some(quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).unwrap()));
+    cfg.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).unwrap(),
+    ));
     cfg
 }
 
@@ -236,8 +235,8 @@ pub fn make_server_config(
     rustls_cfg: rustls::ServerConfig,
     transport: Option<quinn::TransportConfig>,
 ) -> Result<quinn::ServerConfig> {
-    let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
-        .map_err(to_io_error)?;
+    let quic_cfg =
+        quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg).map_err(to_io_error)?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
     if let Some(t) = transport {
         cfg.transport_config(Arc::new(t));
@@ -266,8 +265,8 @@ pub async fn connect_with_tls(
     auth: &AuthRequest,
 ) -> Result<QuicTunnel> {
     let rustls_cfg = tls::make_client_config_with_pin(insecure, cert_pin);
-    let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
-        .map_err(to_io_error)?;
+    let quic_cfg =
+        quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).map_err(to_io_error)?;
     let mut quinn_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
     if let Some(t) = transport {
         quinn_cfg.transport_config(Arc::new(t));

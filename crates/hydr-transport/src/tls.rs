@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use rcgen::CertifiedKey;
+use rustls::SignatureScheme;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::SignatureScheme;
-use rcgen::CertifiedKey;
 use sha2::{Digest, Sha256};
 
 pub fn install_default_provider() {
@@ -16,17 +16,15 @@ pub struct GeneratedCert {
     pub key_der: PrivateKeyDer<'static>,
 }
 
-pub fn generate_self_signed(server_name: &str) -> Result<GeneratedCert, Box<dyn std::error::Error>> {
+pub fn generate_self_signed(
+    server_name: &str,
+) -> Result<GeneratedCert, Box<dyn std::error::Error>> {
     install_default_provider();
-    let CertifiedKey {
-        cert,
-        signing_key,
-    } = rcgen::generate_simple_self_signed(vec![server_name.to_string()])?;
+    let CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec![server_name.to_string()])?;
     Ok(GeneratedCert {
         cert_der: cert.der().clone(),
-        key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            signing_key.serialize_der(),
-        )),
+        key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
     })
 }
 

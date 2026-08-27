@@ -43,7 +43,14 @@ impl BrutalController {
 }
 
 impl Controller for BrutalController {
-    fn on_ack(&mut self, _now: Instant, _sent: Instant, _bytes: u64, _app_limited: bool, rtt: &RttEstimator) {
+    fn on_ack(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _bytes: u64,
+        _app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
         self.window = window_for(self.rate_bps, rtt.get());
     }
 
@@ -98,7 +105,9 @@ pub fn transport_config(rate_bps: u64) -> quinn::TransportConfig {
     cfg.max_concurrent_bidi_streams(1024u32.into());
     cfg.keep_alive_interval(Some(Duration::from_secs(5)));
     // мёртвые соединения закрываются через 30с; keep_alive держит живые
-    cfg.max_idle_timeout(Some(quinn::IdleTimeout::try_from(Duration::from_secs(30)).unwrap()));
+    cfg.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(30)).unwrap(),
+    ));
     if rate_bps > 0 {
         cfg.congestion_controller_factory(Arc::new(BrutalConfig { rate_bps }));
     }
@@ -132,7 +141,9 @@ mod tests {
 
     #[test]
     fn factory_builds_brutal_controller() {
-        let cfg = Arc::new(BrutalConfig { rate_bps: 8_000_000 });
+        let cfg = Arc::new(BrutalConfig {
+            rate_bps: 8_000_000,
+        });
         let c = cfg.build(Instant::now(), 1200);
         let any = c.into_any();
         assert!(

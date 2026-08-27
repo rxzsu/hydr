@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use hydr_core::message::Datagram;
 use hydr_core::{Address, Error, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 
 use crate::TunnelHandle;
 

@@ -72,12 +72,8 @@ impl Address {
                 if buf.len() < start + len + 2 {
                     return Err(Error::UnexpectedEof);
                 }
-                let domain =
-                    String::from_utf8_lossy(&buf[start..start + len]).to_string();
-                let port = u16::from_be_bytes([
-                    buf[start + len],
-                    buf[start + len + 1],
-                ]);
+                let domain = String::from_utf8_lossy(&buf[start..start + len]).to_string();
+                let port = u16::from_be_bytes([buf[start + len], buf[start + len + 1]]);
                 Ok((Address::Domain(domain, port), start + len + 2))
             }
             _ => Err(Error::InvalidData("bad address type")),

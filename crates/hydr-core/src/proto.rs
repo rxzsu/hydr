@@ -12,8 +12,8 @@ pub mod generated {
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
     use super::generated::*;
+    use prost::Message;
 
     #[test]
     fn status_roundtrip() {

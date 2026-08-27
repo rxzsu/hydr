@@ -2,13 +2,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hydr_core::Address;
 use hydr_core::message::{
-    compute_auth_proof, AuthRequest, Datagram, FEATURE_UDP, NONCE_LEN, PROTOCOL_VERSION,
+    AuthRequest, Datagram, FEATURE_UDP, NONCE_LEN, PROTOCOL_VERSION, compute_auth_proof,
 };
 use hydr_core::obfuscation::Obfuscator;
-use hydr_core::Address;
 use hydr_server::WsListen;
-use hydr_transport::{quic, ws, QuicTunnel};
+use hydr_transport::{QuicTunnel, quic, ws};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
@@ -63,8 +63,7 @@ fn auth() -> AuthRequest {
 }
 
 async fn spawn_quic(cfg: ServerConfig) -> (Arc<Server>, SocketAddr, [u8; 32]) {
-    let (ep, fp) =
-        Server::make_quic_endpoint("127.0.0.1:0".parse().unwrap(), "localhost").unwrap();
+    let (ep, fp) = Server::make_quic_endpoint("127.0.0.1:0".parse().unwrap(), "localhost").unwrap();
     let addr = ep.local_addr().unwrap();
     let server = Server::new(cfg);
     tokio::spawn(server.clone().run_quic_endpoint(ep));
@@ -170,7 +169,10 @@ async fn auth_failure_rejected() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut got_err = false;
     while Instant::now() < deadline {
-        if quic::connect(quic_addr, "localhost", true, None, &bad).await.is_err() {
+        if quic::connect(quic_addr, "localhost", true, None, &bad)
+            .await
+            .is_err()
+        {
             got_err = true;
             break;
         }
@@ -198,13 +200,18 @@ async fn replay_detected_on_second_auth_quic() {
     let nonce = [0xABu8; NONCE_LEN];
     let req = fixed_auth(&nonce, PASSWORD.as_bytes(), FEATURE_UDP);
     assert!(
-        quic::connect(quic_addr, "localhost", true, None, &req).await.is_ok(),
+        quic::connect(quic_addr, "localhost", true, None, &req)
+            .await
+            .is_ok(),
         "первый коннект с nonce должен пройти"
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut rejected = false;
     while Instant::now() < deadline {
-        if quic::connect(quic_addr, "localhost", true, None, &req).await.is_err() {
+        if quic::connect(quic_addr, "localhost", true, None, &req)
+            .await
+            .is_err()
+        {
             rejected = true;
             break;
         }
@@ -324,10 +331,7 @@ async fn ws_auth_failure_rejected() {
     drop(server);
 }
 
-async fn spawn_ws_full(
-    path: &str,
-    obf: Option<&str>,
-) -> (Arc<Server>, String) {
+async fn spawn_ws_full(path: &str, obf: Option<&str>) -> (Arc<Server>, String) {
     let l = Server::make_ws_listener("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -386,13 +390,19 @@ async fn max_conns_rejects_extra_tunnels() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut rejected = false;
     while Instant::now() < deadline {
-        if quic::connect(quic_addr, "localhost", true, None, &auth()).await.is_err() {
+        if quic::connect(quic_addr, "localhost", true, None, &auth())
+            .await
+            .is_err()
+        {
             rejected = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(rejected, "второй туннель при max_conns=1 должен быть отклонён");
+    assert!(
+        rejected,
+        "второй туннель при max_conns=1 должен быть отклонён"
+    );
     drop(server);
 }
 

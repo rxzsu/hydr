@@ -1,7 +1,7 @@
 use blake3::Hasher;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::message::TAG_LEN;
 
@@ -149,8 +149,6 @@ impl Obfuscator {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +184,10 @@ mod tests {
         // подменим один байт тела — тег не сойдётся
         let idx = SALT_LEN;
         payload[idx] ^= 0xFF;
-        assert!(ob.decrypt(&payload).is_none(), "подделка должна отвергаться");
+        assert!(
+            ob.decrypt(&payload).is_none(),
+            "подделка должна отвергаться"
+        );
     }
 
     #[test]
@@ -277,7 +278,9 @@ mod tests {
                 }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         // дубликаты после параллели всё ещё отвергаются
         assert!(!f.observe(0));
         assert!(!f.observe(3999));
@@ -290,7 +293,9 @@ mod tests {
         let ob = Obfuscator::new(b"fuzz-key");
         for len in [0, 1, 31, 32, 33, 128, 1024, 4096] {
             for seed in 0..16u64 {
-                let mut payload: Vec<u8> = (0..len).map(|i| (seed.wrapping_add(i as u64) as u8).wrapping_mul(7)).collect();
+                let mut payload: Vec<u8> = (0..len)
+                    .map(|i| (seed.wrapping_add(i as u64) as u8).wrapping_mul(7))
+                    .collect();
                 let orig = payload.clone();
                 ob.encrypt(&mut payload);
                 let dec = ob.decrypt(&payload).expect("decrypt must succeed");

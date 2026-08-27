@@ -2,11 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hydr_core::message::{
-    AuthRequest, AuthResponse, Datagram, FEATURE_UDP, STATUS_OK,
-};
 use hydr_core::Address;
-use hydr_transport::{quic, ws, ServerEvent, Tunnel};
+use hydr_core::message::{AuthRequest, AuthResponse, Datagram, FEATURE_UDP, STATUS_OK};
+use hydr_transport::{ServerEvent, Tunnel, quic, ws};
 
 fn test_auth() -> AuthRequest {
     AuthRequest::new_password(b"test-password", 0, FEATURE_UDP)
@@ -53,8 +51,8 @@ async fn echo_loop(tunnel: &mut Tunnel) {
 async fn spawn_quic_server() -> SocketAddr {
     let cert = hydr_transport::tls::generate_self_signed("localhost").unwrap();
     let server_cfg = hydr_transport::tls::make_server_config(cert.cert_der, cert.key_der).unwrap();
-    let quinn_cfg = quic::make_server_config(server_cfg, Some(quic::default_transport_config()))
-        .unwrap();
+    let quinn_cfg =
+        quic::make_server_config(server_cfg, Some(quic::default_transport_config())).unwrap();
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let endpoint = quinn::Endpoint::server(quinn_cfg, bind).unwrap();
     let local = endpoint.local_addr().unwrap();
@@ -68,11 +66,7 @@ async fn spawn_quic_server() -> SocketAddr {
                 None => break,
             };
             tokio::spawn(async move {
-                let (tunnel, _req) = match quic::server_handshake(conn, |r| {
-                    validator()(r)
-                })
-                .await
-                {
+                let (tunnel, _req) = match quic::server_handshake(conn, |r| validator()(r)).await {
                     Ok(v) => v,
                     Err(_) => return,
                 };
@@ -95,11 +89,10 @@ async fn spawn_ws_server() -> SocketAddr {
             };
             let val = validator();
             tokio::spawn(async move {
-                let (tunnel, _req) =
-                    match ws::accept(tcp, "/hydr", val).await {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
+                let (tunnel, _req) = match ws::accept(tcp, "/hydr", val).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
                 let mut t: Tunnel = Tunnel::Ws(tunnel);
                 echo_loop(&mut t).await;
             });
@@ -206,7 +199,11 @@ async fn quic_datagram_echo() {
     )
     .await
     .unwrap();
-    let dg = Datagram::new(1, Address::Ip("8.8.8.8".parse().unwrap(), 53), b"ping".to_vec());
+    let dg = Datagram::new(
+        1,
+        Address::Ip("8.8.8.8".parse().unwrap(), 53),
+        b"ping".to_vec(),
+    );
     tunnel.send_datagram(&dg).unwrap();
     let echo = tokio::time::timeout(Duration::from_secs(5), tunnel.recv_datagram())
         .await
@@ -221,7 +218,11 @@ async fn ws_datagram_echo() {
     let addr = spawn_ws_server().await;
     let url = format!("ws://{addr}/hydr");
     let mut tunnel = ws::connect(&url, false, &test_auth()).await.unwrap();
-    let dg = Datagram::new(1, Address::Ip("8.8.8.8".parse().unwrap(), 53), b"ping".to_vec());
+    let dg = Datagram::new(
+        1,
+        Address::Ip("8.8.8.8".parse().unwrap(), 53),
+        b"ping".to_vec(),
+    );
     tunnel.send_datagram(&dg).unwrap();
     let echo = tokio::time::timeout(Duration::from_secs(5), tunnel.recv_datagram())
         .await
@@ -259,10 +260,11 @@ async fn spawn_ws_obfuscated(key: Arc<hydr_core::obfuscation::Obfuscator>) -> So
             let val = validator();
             let key = key.clone();
             tokio::spawn(async move {
-                let (tunnel, _req) = match ws::accept_with_obfuscation(tcp, "/hydr", val, Some(key), false).await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
+                let (tunnel, _req) =
+                    match ws::accept_with_obfuscation(tcp, "/hydr", val, Some(key), false).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
                 let mut t: Tunnel = Tunnel::Ws(tunnel);
                 echo_loop(&mut t).await;
             });
@@ -375,9 +377,15 @@ async fn quic_tunnel() -> hydr_transport::Tunnel {
     hydr_transport::tls::install_default_provider();
     let addr = spawn_quic_server().await;
     hydr_transport::Tunnel::Quic(
-        quic::connect(addr, "localhost", true, Some(quic::default_transport_config()), &test_auth())
-            .await
-            .unwrap(),
+        quic::connect(
+            addr,
+            "localhost",
+            true,
+            Some(quic::default_transport_config()),
+            &test_auth(),
+        )
+        .await
+        .unwrap(),
     )
 }
 
@@ -392,7 +400,11 @@ async fn quic_large_datagram() {
     let mut t = quic_tunnel().await;
     // QUIC-датаграммы ограничены MTU пути (~1200 байт), берём заведомо влезающее
     let payload = vec![0xABu8; 1024];
-    let dg = Datagram::new(1, Address::Ip("8.8.8.8".parse().unwrap(), 53), payload.clone());
+    let dg = Datagram::new(
+        1,
+        Address::Ip("8.8.8.8".parse().unwrap(), 53),
+        payload.clone(),
+    );
     t.send_datagram(&dg).unwrap();
     let echo = tokio::time::timeout(Duration::from_secs(5), t.recv_datagram())
         .await
@@ -405,7 +417,11 @@ async fn quic_large_datagram() {
 async fn ws_large_datagram() {
     let mut t = ws_tunnel().await;
     let payload = vec![0xABu8; 4096];
-    let dg = Datagram::new(1, Address::Ip("8.8.8.8".parse().unwrap(), 53), payload.clone());
+    let dg = Datagram::new(
+        1,
+        Address::Ip("8.8.8.8".parse().unwrap(), 53),
+        payload.clone(),
+    );
     t.send_datagram(&dg).unwrap();
     let echo = tokio::time::timeout(Duration::from_secs(5), t.recv_datagram())
         .await
@@ -517,11 +533,11 @@ async fn ws_mux_per_session_auth() {
             };
             let val = mux_validator();
             tokio::spawn(async move {
-                let (tunnel, _req) = match ws::accept_with_obfuscation(tcp, "/hydr", val, None, true).await
-                {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
+                let (tunnel, _req) =
+                    match ws::accept_with_obfuscation(tcp, "/hydr", val, None, true).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
                 let mut t: Tunnel = Tunnel::Ws(tunnel);
                 echo_loop(&mut t).await;
             });
@@ -530,7 +546,9 @@ async fn ws_mux_per_session_auth() {
 
     let url = format!("ws://{local}/hydr");
     // control-сессия (stream_id 0) аутентифицируется паролем pw-a
-    let client = ws::connect(&url, true, &test_auth_pw(b"pw-a")).await.unwrap();
+    let client = ws::connect(&url, true, &test_auth_pw(b"pw-a"))
+        .await
+        .unwrap();
 
     // per-session re-auth сессии 5 паролем pw-b — успех
     let resp = client
@@ -555,7 +573,10 @@ async fn ws_mux_per_session_auth() {
         .authenticate(7, &test_auth_pw(b"nope"))
         .await
         .unwrap();
-    assert_ne!(resp2.status, STATUS_OK, "плохой пароль должен быть отклонён");
+    assert_ne!(
+        resp2.status, STATUS_OK,
+        "плохой пароль должен быть отклонён"
+    );
 
     // открытие потока в неавторизованной сессии 7 — ошибка ERR_PROTOCOL
     let r = client

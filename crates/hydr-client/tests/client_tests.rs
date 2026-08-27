@@ -83,7 +83,9 @@ async fn connect_client(server_quic: SocketAddr, bind: SocketAddr) -> Arc<Client
 }
 
 async fn socks5_connect(proxy: SocketAddr, target: &Address) -> TcpStream {
-    try_socks5_connect(proxy, target).await.expect("socks5 connect")
+    try_socks5_connect(proxy, target)
+        .await
+        .expect("socks5 connect")
 }
 
 async fn try_socks5_connect(proxy: SocketAddr, target: &Address) -> std::io::Result<TcpStream> {

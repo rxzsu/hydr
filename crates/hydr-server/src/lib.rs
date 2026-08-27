@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hydr_core::message::{
-    compute_auth_proof, ct_eq, AuthRequest, AuthResponse, Datagram, ERR_BAD_CREDENTIALS,
-    ERR_CONNECT_FAILED, ERR_PROTOCOL, ERR_UNSUPPORTED, FEATURE_UDP, PROTOCOL_VERSION, STATUS_ERR,
-    STATUS_OK,
+    AuthRequest, AuthResponse, Datagram, ERR_BAD_CREDENTIALS, ERR_CONNECT_FAILED, ERR_PROTOCOL,
+    ERR_UNSUPPORTED, FEATURE_UDP, PROTOCOL_VERSION, STATUS_ERR, STATUS_OK, compute_auth_proof,
+    ct_eq,
 };
-use hydr_transport::{quic, ws, DynStream, ServerEvent, Tunnel, TunnelHandle};
+use hydr_transport::{DynStream, ServerEvent, Tunnel, TunnelHandle, quic, ws};
 use tokio::sync::Mutex;
 
 mod udp;
@@ -260,14 +260,14 @@ impl Server {
                 return;
             }
         };
-        let (endpoint, fp) = match Self::make_quic_endpoint_from_cert(cfg.bind, cert, self.config.cc_rx)
-        {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!("quic listen failed on {}: {e}", cfg.bind);
-                return;
-            }
-        };
+        let (endpoint, fp) =
+            match Self::make_quic_endpoint_from_cert(cfg.bind, cert, self.config.cc_rx) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("quic listen failed on {}: {e}", cfg.bind);
+                    return;
+                }
+            };
         tracing::info!(
             "QUIC certificate fingerprint (sha256): {} — pin it on the client",
             hydr_transport::tls::fingerprint_hex(&fp)
@@ -298,7 +298,8 @@ impl Server {
     ) -> Result<(quinn::Endpoint, [u8; 32]), Box<dyn std::error::Error>> {
         let fp = hydr_transport::tls::cert_fingerprint(&cert.cert_der);
         let rustls_cfg = hydr_transport::tls::make_server_config(cert.cert_der, cert.key_der)?;
-        let quinn_cfg = quic::make_server_config(rustls_cfg, Some(hydr_cc::transport_config(cc_rx)))?;
+        let quinn_cfg =
+            quic::make_server_config(rustls_cfg, Some(hydr_cc::transport_config(cc_rx)))?;
         Ok((quinn::Endpoint::server(quinn_cfg, bind)?, fp))
     }
 
@@ -348,9 +349,7 @@ impl Server {
             .await;
     }
 
-    pub async fn make_ws_listener(
-        bind: SocketAddr,
-    ) -> std::io::Result<tokio::net::TcpListener> {
+    pub async fn make_ws_listener(bind: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
         tokio::net::TcpListener::bind(bind).await
     }
 
@@ -485,7 +484,12 @@ impl Server {
                     .await?,
                 ))
             }
-            NextHopTransport::Ws { url, insecure, obfuscation, fingerprint } => {
+            NextHopTransport::Ws {
+                url,
+                insecure,
+                obfuscation,
+                fingerprint,
+            } => {
                 let pin = hydr_transport::tls::require_fingerprint(fingerprint.as_deref())?;
                 let ob = obfuscation
                     .clone()
@@ -517,7 +521,10 @@ impl Server {
         }
     }
 
-    async fn connect_peer(&self, acc: &hydr_transport::AcceptedStream) -> hydr_core::Result<DynStream> {
+    async fn connect_peer(
+        &self,
+        acc: &hydr_transport::AcceptedStream,
+    ) -> hydr_core::Result<DynStream> {
         if self.config.next_hop.is_some() {
             let downstream = self
                 .downstream
@@ -591,7 +598,10 @@ mod tests {
         assert!(c.insert(b"nonce-4"));
         assert!(!c.insert(b"nonce-1"), "recent entries must stay cached");
         assert!(!c.insert(b"nonce-3"));
-        assert!(c.insert(b"nonce-0"), "oldest entry must be evicted, not the whole cache");
+        assert!(
+            c.insert(b"nonce-0"),
+            "oldest entry must be evicted, not the whole cache"
+        );
 
         // повторное переполнение не ломает инварианты
         assert!(c.insert(b"nonce-5"));

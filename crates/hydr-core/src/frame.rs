@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::varint::{encode_varint, MAX_VARINT};
+use crate::varint::{MAX_VARINT, encode_varint};
 
 pub const FRAME_OPEN_STREAM: u8 = 0x01;
 pub const FRAME_OPEN_STREAM_ACK: u8 = 0x02;
@@ -60,7 +60,9 @@ impl Frame {
         if body_len > MAX_BODY_LEN {
             return Err(Error::InvalidData("frame body too large"));
         }
-        let end = pos.checked_add(body_len).ok_or(Error::InvalidData("frame length overflow"))?;
+        let end = pos
+            .checked_add(body_len)
+            .ok_or(Error::InvalidData("frame length overflow"))?;
         if buf.len() < end {
             return Err(Error::UnexpectedEof);
         }
@@ -162,10 +164,7 @@ mod tests {
         encode_varint(&mut buf, 1);
         buf.push(FRAME_STREAM_DATA);
         encode_varint(&mut buf, u64::MAX);
-        assert!(matches!(
-            Frame::decode(&buf),
-            Err(Error::InvalidData(_))
-        ));
+        assert!(matches!(Frame::decode(&buf), Err(Error::InvalidData(_))));
     }
 
     #[test]

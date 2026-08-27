@@ -2,28 +2,31 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 /// Счётчик дропов датаграмм из-за переполнения WS очереди (мониторинг перегрузки).
 pub static WS_DATAGRAM_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 use futures_util::{SinkExt, StreamExt};
 use hydr_core::frame::{
-    Frame, FRAME_AUTH_REQUEST, FRAME_AUTH_RESPONSE, FRAME_DATAGRAM, FRAME_OPEN_STREAM,
+    FRAME_AUTH_REQUEST, FRAME_AUTH_RESPONSE, FRAME_DATAGRAM, FRAME_OPEN_STREAM,
     FRAME_OPEN_STREAM_ACK, FRAME_PING, FRAME_PONG, FRAME_STREAM_CLOSE, FRAME_STREAM_CREDIT,
-    FRAME_STREAM_DATA,
+    FRAME_STREAM_DATA, Frame,
 };
-use hydr_core::message::{AuthRequest, AuthResponse, Datagram, OpenStream, OpenStreamAck, ERR_PROTOCOL, STATUS_ERR, STATUS_OK};
+use hydr_core::message::{
+    AuthRequest, AuthResponse, Datagram, ERR_PROTOCOL, OpenStream, OpenStreamAck, STATUS_ERR,
+    STATUS_OK,
+};
 use hydr_core::obfuscation::{DecryptOutcome, Obfuscator};
 use hydr_core::varint::{decode_varint, encode_varint};
 use hydr_core::{Address, Error, Result};
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf,
 };
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::http::Response as HttpResponse;
 use tokio_tungstenite::tungstenite::{Bytes, Message};
-use tokio_tungstenite::WebSocketStream;
 use tracing::trace;
 
 use crate::quic::{DynStream, ProxyStream};
@@ -162,7 +165,9 @@ impl WsHandle {
 
     /// Закрывает WS-соединение (останавливает цикл `run`).
     pub fn close(&self) -> Result<()> {
-        self.cmd.try_send(Cmd::Close).map_err(|_| Error::StreamClosed)
+        self.cmd
+            .try_send(Cmd::Close)
+            .map_err(|_| Error::StreamClosed)
     }
 }
 
@@ -252,7 +257,11 @@ impl WsTunnel {
         auth.encode(&mut body);
         self.handle
             .cmd
-            .send(Cmd::SendFrame(Frame::new(session_id, FRAME_AUTH_REQUEST, body)))
+            .send(Cmd::SendFrame(Frame::new(
+                session_id,
+                FRAME_AUTH_REQUEST,
+                body,
+            )))
             .await
             .map_err(|_| Error::StreamClosed)?;
         rx.await.map_err(|_| Error::StreamClosed)?
@@ -319,17 +328,11 @@ impl AsyncWrite for DuplexIo {
         Pin::new(&mut self.w).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.w).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.w).poll_shutdown(cx)
     }
 }
@@ -381,7 +384,11 @@ impl AsyncRead for CreditReader {
                 // канал мёртв — кредиты больше никому не нужны
                 if self
                     .cmd_tx
-                    .try_send(Cmd::SendFrame(Frame::new(self.id, FRAME_STREAM_CREDIT, body)))
+                    .try_send(Cmd::SendFrame(Frame::new(
+                        self.id,
+                        FRAME_STREAM_CREDIT,
+                        body,
+                    )))
                     .is_ok()
                 {
                     self.pending = 0;
@@ -606,6 +613,9 @@ pub async fn accept(
     accept_with_obfuscation(tcp, path, validate, None, false).await
 }
 
+// Тип ошибки `Response<Option<String>>` навязан сигнатурой `Callback` из
+// tokio-tungstenite — уменьшить нельзя без смены версии зависимости.
+#[allow(clippy::result_large_err)]
 pub async fn accept_with_obfuscation(
     tcp: tokio::net::TcpStream,
     path: &str,
@@ -618,9 +628,9 @@ pub async fn accept_with_obfuscation(
         move |req: &tokio_tungstenite::tungstenite::http::Request<()>,
               resp: tokio_tungstenite::tungstenite::http::Response<()>|
               -> std::result::Result<
-                tokio_tungstenite::tungstenite::http::Response<()>,
-                tokio_tungstenite::tungstenite::http::Response<Option<String>>,
-              > {
+            tokio_tungstenite::tungstenite::http::Response<()>,
+            tokio_tungstenite::tungstenite::http::Response<Option<String>>,
+        > {
             if !path.is_empty() && req.uri().path() != path {
                 return Err(HttpResponse::new(Some("Forbidden".into())));
             }

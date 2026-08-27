@@ -2,7 +2,7 @@ pub mod quic;
 pub mod tls;
 pub mod ws;
 
-use hydr_core::message::{OpenStream, OpenStreamAck, ERR_NONE, STATUS_ERR};
+use hydr_core::message::{ERR_NONE, OpenStream, OpenStreamAck, STATUS_ERR};
 use hydr_core::{Address, Datagram, Error, Result};
 pub use quic::{DynStream, ProxyStream, QuicTunnel};
 pub use ws::{IncomingOpen, WsEvent, WsHandle, WsTunnel};
@@ -31,7 +31,10 @@ impl TunnelHandle {
             TunnelHandle::Quic(conn) => {
                 let (mut send, mut recv) = conn.open_bi().await.map_err(quic::to_io_error)?;
                 let mut buf = Vec::new();
-                OpenStream { address: addr.clone() }.encode(&mut buf);
+                OpenStream {
+                    address: addr.clone(),
+                }
+                .encode(&mut buf);
                 quic::write_len_prefixed(&mut send, &buf).await?;
                 let ack = quic::read_message(&mut recv, OpenStreamAck::decode).await?;
                 if ack.status == STATUS_ERR {
@@ -128,7 +131,16 @@ impl AcceptedStream {
             } => {
                 let a_read = a_read.take().ok_or(hydr_core::Error::StreamClosed)?;
                 let a_write = a_write.take().ok_or(hydr_core::Error::StreamClosed)?;
-                ws::reply_open(cmd, *id, status, error_code, message.to_vec(), a_read, a_write).await
+                ws::reply_open(
+                    cmd,
+                    *id,
+                    status,
+                    error_code,
+                    message.to_vec(),
+                    a_read,
+                    a_write,
+                )
+                .await
             }
         }
     }

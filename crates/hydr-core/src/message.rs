@@ -34,7 +34,9 @@ fn derive_key(password: &[u8]) -> [u8; 32] {
 /// Доказательство владения паролем: keyed_hash(password, nonce).
 /// Сырой пароль в канал не уходит; nonce делает доказательство уникальным.
 pub fn compute_auth_proof(password: &[u8], nonce: &[u8]) -> Vec<u8> {
-    blake3::keyed_hash(&derive_key(password), nonce).as_bytes().to_vec()
+    blake3::keyed_hash(&derive_key(password), nonce)
+        .as_bytes()
+        .to_vec()
 }
 
 /// Константно-по-времени сравнение (защита от timing-атак на доказательство).
@@ -81,9 +83,7 @@ impl AuthRequest {
     ) -> crate::error::Result<Self> {
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce).map_err(|e| {
-            crate::error::Error::Io(std::io::Error::other(format!(
-                "CSPRNG unavailable: {e}"
-            )))
+            crate::error::Error::Io(std::io::Error::other(format!("CSPRNG unavailable: {e}")))
         })?;
         let proof = compute_auth_proof(password, &nonce);
         Ok(Self {
@@ -300,11 +300,7 @@ pub struct Datagram {
 }
 
 impl Datagram {
-    pub fn new(
-        session_id: u32,
-        address: Address,
-        payload: Vec<u8>,
-    ) -> Self {
+    pub fn new(session_id: u32, address: Address, payload: Vec<u8>) -> Self {
         Self {
             session_id,
             packet_id: 0,
@@ -425,7 +421,11 @@ mod tests {
 
     #[test]
     fn datagram_roundtrip() {
-        let a = Datagram::new(7, Address::Ip("8.8.8.8".parse().unwrap(), 53), vec![1, 2, 3]);
+        let a = Datagram::new(
+            7,
+            Address::Ip("8.8.8.8".parse().unwrap(), 53),
+            vec![1, 2, 3],
+        );
         let mut buf = Vec::new();
         a.encode(&mut buf);
         let (b, used) = Datagram::decode(&buf).unwrap();
@@ -505,7 +505,10 @@ mod tests {
         // сырой пароль не должен фигурировать в закодированном виде
         let mut buf = Vec::new();
         a.encode(&mut buf);
-        assert!(!buf.windows(b"super-secret".len()).any(|w| w == b"super-secret"));
+        assert!(
+            !buf.windows(b"super-secret".len())
+                .any(|w| w == b"super-secret")
+        );
     }
 
     #[test]
@@ -571,7 +574,11 @@ mod tests {
 
     #[test]
     fn datagram_single_fragment_default() {
-        let a = Datagram::new(3, Address::Ip("1.2.3.4".parse().unwrap(), 53), vec![9, 8, 7]);
+        let a = Datagram::new(
+            3,
+            Address::Ip("1.2.3.4".parse().unwrap(), 53),
+            vec![9, 8, 7],
+        );
         assert_eq!(a.frag_count, 1);
         assert_eq!(a.frag_id, 0);
         assert_eq!(a.packet_id, 0);
@@ -632,7 +639,11 @@ mod tests {
     fn datagram_fragments_are_independent_messages() {
         // каждый фрагмент — отдельное Datagram-сообщение; поля должны
         // сохраняться независимо для каждого из них
-        let mut f0 = Datagram::new(7, Address::Ip("8.8.8.8".parse().unwrap(), 53), b"part0".to_vec());
+        let mut f0 = Datagram::new(
+            7,
+            Address::Ip("8.8.8.8".parse().unwrap(), 53),
+            b"part0".to_vec(),
+        );
         f0.packet_id = 42;
         f0.frag_id = 0;
         f0.frag_count = 3;

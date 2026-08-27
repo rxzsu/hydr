@@ -49,7 +49,17 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        for v in [0u64, 1, 63, 64, 16383, 16384, (1 << 30) - 1, 1 << 30, (1 << 62) - 1] {
+        for v in [
+            0u64,
+            1,
+            63,
+            64,
+            16383,
+            16384,
+            (1 << 30) - 1,
+            1 << 30,
+            (1 << 62) - 1,
+        ] {
             let mut buf = Vec::new();
             encode_varint(&mut buf, v);
             assert_eq!(encode_varint_len(v), buf.len());
