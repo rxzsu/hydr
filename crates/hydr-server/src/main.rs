@@ -77,6 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws,
         next_hop,
         max_conns: file.max_conns.unwrap_or(0),
+        max_udp_sessions: file.max_udp_sessions.unwrap_or(0),
+        max_udp_sessions_per_ip: file.max_udp_sessions_per_ip.unwrap_or(0),
+        metrics_bind: file.metrics_bind.as_deref().map(str::parse).transpose()?,
     };
 
     if config.quic.is_none() && config.ws.is_none() {

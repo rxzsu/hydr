@@ -2,6 +2,7 @@ pub mod address;
 pub mod error;
 pub mod frame;
 pub mod message;
+pub mod metrics;
 pub mod obfuscation;
 pub mod varint;
 

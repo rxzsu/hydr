@@ -5,7 +5,7 @@ use std::time::Duration;
 use hydr_core::Address;
 use hydr_core::message::{AuthRequest, FEATURE_UDP};
 use hydr_transport::{DynStream, ProxyStream, Tunnel, TunnelHandle, quic, ws};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 mod socks5;
@@ -19,6 +19,10 @@ pub struct ClientConfig {
     pub password: String,
     pub cc_rx: u64,
     pub socks5_bind: SocketAddr,
+    /// SOCKS5 user/pass (RFC 1929). `None` — без аутентификации (только для
+    /// loopback-бинда; на внешних адресах без auth стартуем с warn).
+    pub socks5_username: Option<String>,
+    pub socks5_password: Option<String>,
 }
 
 #[derive(Clone)]
@@ -54,6 +58,12 @@ pub struct Client {
 impl Client {
     pub async fn connect(config: ClientConfig) -> hydr_core::Result<Client> {
         hydr_transport::tls::install_default_provider();
+        if config.socks5_username.is_none() && !config.socks5_bind.ip().is_loopback() {
+            tracing::warn!(
+                "SOCKS5 on non-loopback {} without user/pass: anyone on the network can use the proxy",
+                config.socks5_bind
+            );
+        }
         let tunnel = Self::connect_tunnel(&config).await?;
         let handle = Arc::new(tokio::sync::RwLock::new(TunnelHandle::from_tunnel(&tunnel)));
         let udp = Arc::new(UdpRelay::new(handle.clone()));
@@ -252,19 +262,23 @@ impl Client {
         mut tcp: tokio::net::TcpStream,
         peer: SocketAddr,
     ) -> hydr_core::Result<()> {
-        let mut buf = [0u8; 2];
-        tcp.read_exact(&mut buf).await?;
-        if buf[0] != 5 {
-            return Err(hydr_core::Error::InvalidData("bad socks version"));
+        let require_auth = self.config.socks5_username.is_some();
+        match socks5::negotiate_method(&mut tcp, require_auth).await? {
+            Some(m) if m == socks5::METHOD_USERPASS => {
+                let (user, pass) = (
+                    self.config.socks5_username.clone().unwrap_or_default(),
+                    self.config.socks5_password.clone().unwrap_or_default(),
+                );
+                if !socks5::verify_userpass(&mut tcp, &user, &pass).await? {
+                    tracing::debug!("socks5 userpass rejected for {peer}");
+                    return Err(hydr_core::Error::InvalidData("socks5 auth failed"));
+                }
+            }
+            Some(_) => {}
+            None => {
+                return Err(hydr_core::Error::InvalidData("no acceptable auth method"));
+            }
         }
-        let nmethods = buf[1] as usize;
-        let mut methods = vec![0u8; nmethods];
-        tcp.read_exact(&mut methods).await?;
-        if !methods.contains(&0) {
-            tcp.write_all(&[5, 0xff]).await?;
-            return Err(hydr_core::Error::InvalidData("no acceptable auth method"));
-        }
-        tcp.write_all(&[5, 0]).await?;
 
         let req = socks5::read_request(&mut tcp).await?;
         match req.cmd {

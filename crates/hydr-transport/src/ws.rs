@@ -62,6 +62,14 @@ impl StreamCredit {
 
     /// Ждёт, пока окно не позволит послать следующий чанк.
     async fn wait_window(&self) {
+        // Первый быстрый путь без счётчика: горячий путь не должен дёргать
+        // глобальный atomic на каждый чанк.
+        if *self.outstanding.lock().await < RECV_WINDOW {
+            return;
+        }
+        hydr_core::metrics::global()
+            .ws_credit_waits
+            .fetch_add(1, Ordering::Relaxed);
         loop {
             let fut = self.notify.notified();
             tokio::pin!(fut);
@@ -156,6 +164,9 @@ impl WsHandle {
             // тихо дропнуть пакет, чем убивать сессию
             Err(mpsc::error::TrySendError::Full(_)) => {
                 WS_DATAGRAM_DROPPED.fetch_add(1, Ordering::Relaxed);
+                hydr_core::metrics::global()
+                    .ws_datagrams_dropped
+                    .fetch_add(1, Ordering::Relaxed);
                 trace!("ws outbound queue full; dropping datagram");
                 Ok(())
             }

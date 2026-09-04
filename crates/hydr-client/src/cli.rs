@@ -29,6 +29,13 @@ pub struct ClientFile {
     pub cc_rx: Option<u64>,
     /// Локальный SOCKS5 адрес (например 127.0.0.1:1080)
     pub socks5_bind: String,
+    /// SOCKS5 user/pass (RFC 1929). Обязательны при бинде на внешний адрес:
+    /// без них прокси открыт для всей сети. Пароль можно задать через
+    /// env `HYDR_SOCKS5_PASSWORD` (приоритет над конфигом).
+    #[serde(default)]
+    pub socks5_username: Option<String>,
+    #[serde(default)]
+    pub socks5_password: Option<String>,
     pub transport: TransportFile,
 }
 
@@ -68,6 +75,19 @@ impl ClientFile {
             .ok_or_else(|| {
                 "password not set: use `password`, `password_file` or env HYDR_PASSWORD".into()
             })
+    }
+
+    /// Пароль SOCKS5: env `HYDR_SOCKS5_PASSWORD` приоритетнее конфига.
+    /// Возвращает `None`, если username не задан (auth выключен).
+    pub fn resolve_socks5_password(&self) -> Option<String> {
+        self.socks5_username.as_ref()?;
+        if let Ok(env) = std::env::var("HYDR_SOCKS5_PASSWORD") {
+            let env = env.trim().to_string();
+            if !env.is_empty() {
+                return Some(env);
+            }
+        }
+        self.socks5_password.clone()
     }
 }
 

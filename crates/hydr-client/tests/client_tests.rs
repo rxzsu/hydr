@@ -53,6 +53,9 @@ async fn spawn_quic() -> (Arc<Server>, SocketAddr) {
         ws: None,
         next_hop: None,
         max_conns: 0,
+        max_udp_sessions: 0,
+        max_udp_sessions_per_ip: 0,
+        metrics_bind: None,
     });
     tokio::spawn(server.clone().run_quic_endpoint(ep));
     (server, addr)
@@ -71,6 +74,8 @@ async fn connect_client(server_quic: SocketAddr, bind: SocketAddr) -> Arc<Client
             password: PASSWORD.into(),
             cc_rx: 0,
             socks5_bind: bind,
+            socks5_username: None,
+            socks5_password: None,
         };
         match Client::connect(cfg).await {
             Ok(c) => return Arc::new(c),
@@ -80,6 +85,72 @@ async fn connect_client(server_quic: SocketAddr, bind: SocketAddr) -> Arc<Client
             Err(e) => panic!("client connect failed: {e}"),
         }
     }
+}
+
+async fn connect_client_auth(
+    server_quic: SocketAddr,
+    bind: SocketAddr,
+    user: &str,
+    pass: &str,
+) -> Arc<Client> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let cfg = ClientConfig {
+            transport: ClientTransport::Quic {
+                addr: server_quic,
+                server_name: "localhost".into(),
+                insecure: true,
+                fingerprint: None,
+            },
+            password: PASSWORD.into(),
+            cc_rx: 0,
+            socks5_bind: bind,
+            socks5_username: Some(user.into()),
+            socks5_password: Some(pass.into()),
+        };
+        match Client::connect(cfg).await {
+            Ok(c) => return Arc::new(c),
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("client connect failed: {e}"),
+        }
+    }
+}
+
+/// SOCKS5 CONNECT с user/pass: выполняет method-negotiation (0x02) и RFC 1929.
+async fn socks5_connect_auth(
+    proxy: SocketAddr,
+    target: &Address,
+    user: &str,
+    pass: &str,
+) -> std::io::Result<TcpStream> {
+    let mut s = TcpStream::connect(proxy).await?;
+    s.write_all(&[5, 2, 0, 2]).await?;
+    let mut resp = [0u8; 2];
+    s.read_exact(&mut resp).await?;
+    if resp != [5, 2] {
+        return Err(std::io::Error::other("userpass method not accepted"));
+    }
+    let mut req = vec![1, user.len() as u8];
+    req.extend_from_slice(user.as_bytes());
+    req.push(pass.len() as u8);
+    req.extend_from_slice(pass.as_bytes());
+    s.write_all(&req).await?;
+    let mut verdict = [0u8; 2];
+    s.read_exact(&mut verdict).await?;
+    if verdict != [1, 0] {
+        return Err(std::io::Error::other("userpass rejected"));
+    }
+    let mut conn = vec![5, 1, 0];
+    target.encode(&mut conn);
+    s.write_all(&conn).await?;
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await?;
+    if reply[1] != 0 {
+        return Err(std::io::Error::other("connect refused"));
+    }
+    Ok(s)
 }
 
 async fn socks5_connect(proxy: SocketAddr, target: &Address) -> TcpStream {
@@ -258,6 +329,9 @@ async fn spawn_ws_server() -> (Arc<Server>, String) {
         ws: None,
         next_hop: None,
         max_conns: 0,
+        max_udp_sessions: 0,
+        max_udp_sessions_per_ip: 0,
+        metrics_bind: None,
     };
     cfg.ws = Some(WsListen {
         bind: addr,
@@ -282,6 +356,8 @@ async fn connect_client_ws(url: &str, bind: SocketAddr) -> Arc<Client> {
             password: PASSWORD.into(),
             cc_rx: 0,
             socks5_bind: bind,
+            socks5_username: None,
+            socks5_password: None,
         };
         match Client::connect(cfg).await {
             Ok(c) => return Arc::new(c),
@@ -346,4 +422,51 @@ async fn two_socks5_listeners_share_one_tunnel() {
             .expect("socks5 timeout")
             .expect("socks5 ok");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks5_userpass_end_to_end() {
+    let (echo, _eh) = echo_tcp().await;
+    let (_server, quic_addr) = spawn_quic().await;
+
+    let client =
+        connect_client_auth(quic_addr, "127.0.0.1:0".parse().unwrap(), "alice", "s3cr3t").await;
+    let listener = client.socks5_listener().await.unwrap();
+    let socks5_addr = listener.local_addr().unwrap();
+    tokio::spawn(client.clone().serve_datagrams());
+    tokio::spawn(client.clone().run_socks5_on(listener));
+
+    let target = Address::Ip(echo.ip(), echo.port());
+    let mut s = socks5_connect_auth(socks5_addr, &target, "alice", "s3cr3t")
+        .await
+        .expect("userpass connect");
+    s.write_all(b"hello auth").await.unwrap();
+    let mut buf = [0u8; 10];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello auth");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks5_userpass_rejects_bad_password_and_no_auth() {
+    let (_server, quic_addr) = spawn_quic().await;
+
+    let client =
+        connect_client_auth(quic_addr, "127.0.0.1:0".parse().unwrap(), "alice", "s3cr3t").await;
+    let listener = client.socks5_listener().await.unwrap();
+    let socks5_addr = listener.local_addr().unwrap();
+    tokio::spawn(client.clone().run_socks5_on(listener));
+
+    let target = Address::Ip("127.0.0.1".parse().unwrap(), 9);
+    // неверный пароль
+    assert!(
+        socks5_connect_auth(socks5_addr, &target, "alice", "wrong")
+            .await
+            .is_err(),
+        "wrong userpass must be rejected"
+    );
+    // no-auth метод при включённой auth — сервер отвечает 0xFF
+    assert!(
+        try_socks5_connect(socks5_addr, &target).await.is_err(),
+        "no-auth method must be refused when userpass is required"
+    );
 }

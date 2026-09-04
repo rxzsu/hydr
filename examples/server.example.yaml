@@ -11,6 +11,14 @@ cc_rx: 0
 # max concurrent tunnels (0 = default 1024)
 max_conns: 0
 
+# UDP session caps: global (0 = default 4096) and per client IP (0 = default 64);
+# excess sessions are rejected with [code 0x02] (rate limited)
+max_udp_sessions: 0
+max_udp_sessions_per_ip: 0
+
+# Prometheus /metrics endpoint (empty = disabled); scrape locally, e.g. 127.0.0.1:9090
+# metrics_bind: "127.0.0.1:9090"
+
 quic:
   bind: "0.0.0.0:8443"
   server_name: "example.com"

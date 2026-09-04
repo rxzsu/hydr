@@ -16,6 +16,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = cli::load(&args.config)?;
 
     let password = file.resolve_password()?;
+    let socks5_password = file.resolve_socks5_password();
+    let socks5_username = file.socks5_username.clone();
     let transport = match file.transport {
         cli::TransportFile::Quic {
             addr,
@@ -45,6 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         password,
         cc_rx: file.cc_rx.unwrap_or(0),
         socks5_bind: file.socks5_bind.parse()?,
+        socks5_username,
+        socks5_password,
     })
     .await?;
     let client = Arc::new(client);

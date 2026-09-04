@@ -55,6 +55,9 @@ fn base_config() -> ServerConfig {
         ws: None,
         next_hop: None,
         max_conns: 0,
+        max_udp_sessions: 0,
+        max_udp_sessions_per_ip: 0,
+        metrics_bind: None,
     }
 }
 
@@ -429,4 +432,60 @@ async fn cert_pinning_rejects_wrong_fingerprint() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Глобальный cap UDP-сессий: вторая сессия при max_udp_sessions=1 не создаётся
+/// ( observable как отсутствие ответа — сервер тихо отбрасывает с code 0x02).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_session_global_cap_rejects_second_session() {
+    let (echo, _eh) = echo_udp().await;
+    let mut cfg = base_config();
+    cfg.max_udp_sessions = 1;
+    let (_server, quic_addr, _fp) = spawn_quic(cfg).await;
+    let mut t = hydr_transport::Tunnel::Quic(connect_quic(quic_addr).await);
+
+    // первая сессия занимает единственный слот
+    let dg1 = Datagram::new(7, Address::Ip(echo.ip(), echo.port()), b"one".to_vec());
+    t.send_datagram(&dg1).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(10), t.recv_datagram())
+        .await
+        .expect("first session reply timeout")
+        .expect("first session ok");
+    assert_eq!(reply.payload, b"one");
+    assert_eq!(reply.session_id, 7);
+
+    // вторая сессия сверх cap'а: ответа не будет
+    let dg2 = Datagram::new(8, Address::Ip(echo.ip(), echo.port()), b"two".to_vec());
+    t.send_datagram(&dg2).unwrap();
+    let res = tokio::time::timeout(Duration::from_millis(700), t.recv_datagram()).await;
+    assert!(
+        res.is_err(),
+        "second udp session beyond global cap must get no reply"
+    );
+}
+
+/// Per-IP cap: max_udp_sessions_per_ip=1 при просторном глобальном лимите.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_session_per_ip_cap_rejects_second_session() {
+    let (echo, _eh) = echo_udp().await;
+    let mut cfg = base_config();
+    cfg.max_udp_sessions_per_ip = 1;
+    let (_server, quic_addr, _fp) = spawn_quic(cfg).await;
+    let mut t = hydr_transport::Tunnel::Quic(connect_quic(quic_addr).await);
+
+    let dg1 = Datagram::new(11, Address::Ip(echo.ip(), echo.port()), b"one".to_vec());
+    t.send_datagram(&dg1).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(10), t.recv_datagram())
+        .await
+        .expect("first session reply timeout")
+        .expect("first session ok");
+    assert_eq!(reply.session_id, 11);
+
+    let dg2 = Datagram::new(12, Address::Ip(echo.ip(), echo.port()), b"two".to_vec());
+    t.send_datagram(&dg2).unwrap();
+    let res = tokio::time::timeout(Duration::from_millis(700), t.recv_datagram()).await;
+    assert!(
+        res.is_err(),
+        "second udp session beyond per-ip cap must get no reply"
+    );
 }

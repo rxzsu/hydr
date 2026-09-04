@@ -32,6 +32,14 @@ pub struct ServerFile {
     /// Максимум одновременных туннелей (0 — значение по умолчанию 1024)
     #[serde(default)]
     pub max_conns: Option<usize>,
+    /// Cap UDP-сессий: глобальный (0 — дефолт 4096) и на один IP (0 — дефолт 64)
+    #[serde(default)]
+    pub max_udp_sessions: Option<usize>,
+    #[serde(default)]
+    pub max_udp_sessions_per_ip: Option<usize>,
+    /// Адрес Prometheus /metrics (например "127.0.0.1:9090"); пусто — выключен
+    #[serde(default)]
+    pub metrics_bind: Option<String>,
     #[serde(default)]
     pub quic: Option<QuicFile>,
     #[serde(default)]

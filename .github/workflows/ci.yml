@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Строгая проверка уязвимостей по расписанию: ловит новые CVE в уже
+  # зафиксированных зависимостях (Cargo.lock) без нового коммита.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   check:
@@ -19,10 +24,39 @@ jobs:
       - run: cargo test -p hydr-core --features proto
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo fmt --all -- --check
-      - run: cargo install cargo-audit --locked || true
-      - run: cargo audit || true
-      - run: cargo install cargo-deny --locked || true
-      - run: cargo deny check || true
+      # Блокирующие проверки безопасности: уязвимость в зависимостях должна
+      # ронять CI, а не проходить silently. Установка инструментов остаётся
+      # best-effort (сеть до crates.io может быть недоступна), но сами
+      # проверки строгие: если бинарь не поставился — шаг помечает warning
+      # через `command -v`, а не молча глотает результат.
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked || echo "::warning::cargo-audit install failed (network?)"
+      - name: cargo audit (blocking)
+        run: |
+          if command -v cargo-audit >/dev/null; then cargo audit; else echo "::warning::cargo-audit missing, skipping"; exit 1; fi
+      - name: install cargo-deny
+        run: cargo install cargo-deny --locked || echo "::warning::cargo-deny install failed (network?)"
+      - name: cargo deny (blocking)
+        run: |
+          if command -v cargo-deny >/dev/null; then cargo deny check; else echo "::warning::cargo-deny missing, skipping"; exit 1; fi
+
+  # Еженедельный строгий аудит зафиксированных зависимостей (по расписанию
+  # и вручную): дублирует проверки из `check`, чтобы новые CVE в Cargo.lock
+  # ловились без нового коммита.
+  audit-scheduled:
+    name: scheduled security audit (strict)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
 
   # Опциональный Protobuf-IDL (feature `proto`) требует бинарь `protoc`.
   proto:

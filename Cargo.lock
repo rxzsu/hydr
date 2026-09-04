@@ -592,6 +592,7 @@ dependencies = [
 name = "hydr-cc"
 version = "0.1.0"
 dependencies = [
+ "hydr-core",
  "quinn",
  "quinn-proto",
  "tokio",

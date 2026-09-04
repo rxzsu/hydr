@@ -14,7 +14,9 @@ use tokio::sync::Mutex;
 
 mod udp;
 
-pub use udp::UdpManager;
+pub use udp::{DEFAULT_MAX_UDP_SESSIONS, DEFAULT_MAX_UDP_SESSIONS_PER_IP, UdpManager};
+
+pub mod metrics_endpoint;
 
 const DEFAULT_MAX_CONNS: usize = 1024;
 /// Окно и лимит попыток аутентификации на один IP (анти-брутфорс).
@@ -31,6 +33,13 @@ pub struct ServerConfig {
     pub next_hop: Option<NextHop>,
     /// Максимум одновременных туннелей (0 — значение по умолчанию).
     pub max_conns: usize,
+    /// Cap UDP-сессий: глобальный (0 — дефолт 4096) и на один IP
+    /// (0 — дефолт 64). Превышение → ошибка `[code 0x02]`.
+    pub max_udp_sessions: usize,
+    pub max_udp_sessions_per_ip: usize,
+    /// Адрес Prometheus `/metrics`-эндпоинта (например 127.0.0.1:9090);
+    /// `None` — не поднимать.
+    pub metrics_bind: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -83,6 +92,8 @@ pub struct Server {
     /// Кэш использованных client_nonce для защиты от replay атак.
     replay_nonces: std::sync::Mutex<NonceCache>,
     conns_active: AtomicU64,
+    /// Монотонный id туннеля для трейсинга (multi-hop дебаг).
+    next_tunnel_id: AtomicU64,
 }
 
 /// Максимальный размер кэша nonce; при превышении вытесняется самая старая
@@ -146,25 +157,32 @@ impl Server {
         } else {
             config.max_conns
         };
+        let udp_max = config.max_udp_sessions;
+        let udp_per_ip = config.max_udp_sessions_per_ip;
         Arc::new(Self {
             config,
             downstream: Mutex::new(None),
-            udp: UdpManager::new(),
+            udp: UdpManager::with_limits(udp_max, udp_per_ip),
             conn_permits: Arc::new(tokio::sync::Semaphore::new(max_conns)),
             auth_attempts: std::sync::Mutex::new(HashMap::new()),
             replay_nonces: std::sync::Mutex::new(NonceCache::new(REPLAY_CACHE_MAX)),
             conns_active: AtomicU64::new(0),
+            next_tunnel_id: AtomicU64::new(1),
         })
     }
 
     fn validate(&self, req: &AuthRequest) -> hydr_core::Result<AuthResponse> {
+        use std::sync::atomic::Ordering;
+        let m = hydr_core::metrics::global();
         if req.version != PROTOCOL_VERSION {
+            m.auth_unsupported.fetch_add(1, Ordering::Relaxed);
             return Ok(AuthResponse::error_with_code(
                 ERR_UNSUPPORTED,
                 "unsupported protocol version",
             ));
         }
         if req.client_nonce.len() < 8 {
+            m.auth_replay.fetch_add(1, Ordering::Relaxed);
             return Ok(AuthResponse::error_with_code(
                 ERR_PROTOCOL,
                 "client nonce too short",
@@ -172,17 +190,20 @@ impl Server {
         }
         let expected = compute_auth_proof(self.config.password.as_bytes(), &req.client_nonce);
         if !ct_eq(&expected, &req.auth_proof) {
+            m.auth_bad_credentials.fetch_add(1, Ordering::Relaxed);
             return Ok(AuthResponse::error_with_code(
                 ERR_BAD_CREDENTIALS,
                 "invalid credentials",
             ));
         }
         if !self.nonce_seen(&req.client_nonce) {
+            m.auth_replay.fetch_add(1, Ordering::Relaxed);
             return Ok(AuthResponse::error_with_code(
                 ERR_PROTOCOL,
                 "replay detected",
             ));
         }
+        m.auth_ok.fetch_add(1, Ordering::Relaxed);
         Ok(AuthResponse::ok(self.config.cc_rx, FEATURE_UDP))
     }
 
@@ -239,6 +260,12 @@ impl Server {
                 server.run_ws(&w).await;
             }));
         }
+        if let Some(bind) = self.config.metrics_bind {
+            let server = self.clone();
+            handles.push(tokio::spawn(async move {
+                metrics_endpoint::serve(bind, server.udp.clone()).await;
+            }));
+        }
         if handles.is_empty() {
             return Err(hydr_core::Error::InvalidData("no listeners configured"));
         }
@@ -246,6 +273,19 @@ impl Server {
             let _ = h.await;
         }
         Ok(())
+    }
+
+    /// Строит quinn `ServerConfig` из готового сертификата (переиспользуется
+    /// и при старте, и при hot-reload по SIGHUP/mtime).
+    fn build_quinn_server_config(
+        cert: hydr_transport::tls::GeneratedCert,
+        cc_rx: u64,
+    ) -> Result<quinn::ServerConfig, Box<dyn std::error::Error>> {
+        let rustls_cfg = hydr_transport::tls::make_server_config(cert.cert_der, cert.key_der)?;
+        Ok(quic::make_server_config(
+            rustls_cfg,
+            Some(hydr_cc::transport_config(cc_rx)),
+        )?)
     }
 
     async fn run_quic(self: Arc<Self>, cfg: &QuicListen) {
@@ -260,19 +300,108 @@ impl Server {
                 return;
             }
         };
-        let (endpoint, fp) =
-            match Self::make_quic_endpoint_from_cert(cfg.bind, cert, self.config.cc_rx) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!("quic listen failed on {}: {e}", cfg.bind);
-                    return;
-                }
-            };
+        let fp = hydr_transport::tls::cert_fingerprint(&cert.cert_der);
+        let quinn_cfg = match Self::build_quinn_server_config(cert, self.config.cc_rx) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("quic listen failed on {}: {e}", cfg.bind);
+                return;
+            }
+        };
+        let endpoint = match quinn::Endpoint::server(quinn_cfg, cfg.bind) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("quic listen failed on {}: {e}", cfg.bind);
+                return;
+            }
+        };
         tracing::info!(
             "QUIC certificate fingerprint (sha256): {} — pin it on the client",
             hydr_transport::tls::fingerprint_hex(&fp)
         );
+        // Hot-reload PEM без рестарта: SIGHUP (unix) + опрос mtime (все ОС).
+        // Новые handshake'ы подхватят сертификат, живые соединения не рвутся.
+        if cfg.cert.is_some() && cfg.key.is_some() {
+            Self::spawn_cert_reload(endpoint.clone(), cfg.clone(), self.config.cc_rx, fp);
+        }
         self.run_quic_endpoint(endpoint).await;
+    }
+
+    /// Фоновая задача: перечитывает PEM при SIGHUP или изменении mtime и
+    /// подменяет `ServerConfig` эндпоинта на лету.
+    fn spawn_cert_reload(
+        endpoint: quinn::Endpoint,
+        cfg: QuicListen,
+        cc_rx: u64,
+        mut current_fp: [u8; 32],
+    ) {
+        let cert_path = cfg.cert.clone().unwrap();
+        let key_path = cfg.key.clone().unwrap();
+        let server_name = cfg.server_name.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            let mut sighup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::warn!("sighup watch unavailable: {e}");
+                        None
+                    }
+                };
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_mtime: Option<std::time::SystemTime> = None;
+            loop {
+                #[cfg(unix)]
+                let hup: bool = match sighup.as_mut() {
+                    // SIGHUP — немедленная проверка, тик — фоновая (mtime).
+                    Some(s) => tokio::select! {
+                        _ = s.recv() => true,
+                        _ = tick.tick() => false,
+                    },
+                    None => {
+                        tick.tick().await;
+                        false
+                    }
+                };
+                #[cfg(not(unix))]
+                let hup: bool = {
+                    tick.tick().await;
+                    false
+                };
+                let mtime = std::fs::metadata(&cert_path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                if !hup && mtime == last_mtime {
+                    continue;
+                }
+                last_mtime = mtime;
+                match hydr_transport::tls::load_or_generate_self_signed(
+                    &server_name,
+                    Some(std::path::Path::new(&cert_path)),
+                    Some(std::path::Path::new(&key_path)),
+                ) {
+                    Ok(g) => {
+                        let fp = hydr_transport::tls::cert_fingerprint(&g.cert_der);
+                        if fp == current_fp {
+                            continue;
+                        }
+                        match Self::build_quinn_server_config(g, cc_rx) {
+                            Ok(quinn_cfg) => {
+                                endpoint.set_server_config(Some(quinn_cfg));
+                                current_fp = fp;
+                                tracing::info!(
+                                    "QUIC certificate reloaded, new fingerprint (sha256): {}",
+                                    hydr_transport::tls::fingerprint_hex(&fp)
+                                );
+                            }
+                            Err(e) => tracing::error!("quic cert reload failed: {e}"),
+                        }
+                    }
+                    Err(e) => tracing::error!("quic cert reload failed: {e}"),
+                }
+            }
+        });
     }
 
     pub fn make_quic_endpoint(
@@ -312,6 +441,9 @@ impl Server {
             };
             let peer = incoming.remote_address();
             if !self.rate_allow(peer.ip()) {
+                hydr_core::metrics::global()
+                    .auth_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("auth rate limit exceeded for {peer}");
                 continue;
             }
@@ -324,6 +456,7 @@ impl Server {
                         return;
                     }
                 };
+                let peer_ip = conn.remote_address().ip();
                 let (tunnel, _req) =
                     match quic::server_handshake(conn, |r| server.validate(r)).await {
                         Ok(v) => v,
@@ -332,7 +465,7 @@ impl Server {
                             return;
                         }
                     };
-                server.handle_tunnel(Tunnel::Quic(tunnel)).await;
+                server.handle_tunnel(Tunnel::Quic(tunnel), peer_ip).await;
             });
         }
     }
@@ -369,6 +502,9 @@ impl Server {
                 }
             };
             if !self.rate_allow(peer.ip()) {
+                hydr_core::metrics::global()
+                    .auth_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("auth rate limit exceeded for {peer}");
                 continue;
             }
@@ -395,12 +531,16 @@ impl Server {
                             return;
                         }
                     };
-                server.handle_tunnel(Tunnel::Ws(tunnel)).await;
+                server.handle_tunnel(Tunnel::Ws(tunnel), peer.ip()).await;
             });
         }
     }
 
-    async fn handle_tunnel(self: Arc<Self>, tunnel: Tunnel) {
+    async fn handle_tunnel(self: Arc<Self>, tunnel: Tunnel, client_ip: IpAddr) {
+        let tunnel_id = self.next_tunnel_id.fetch_add(1, Ordering::Relaxed);
+        // Спан несёт id туннеля и IP клиента — дебаг multi-hop цепочек.
+        let span = tracing::info_span!("tunnel", id = tunnel_id, client = %client_ip);
+        let _guard = span.enter();
         let Some(permit) = self.try_take_conn() else {
             tracing::warn!(
                 "connection rejected: {} concurrent tunnels",
@@ -409,6 +549,7 @@ impl Server {
             tunnel.close().await;
             return;
         };
+        tracing::debug!("tunnel opened");
         let handle = TunnelHandle::from_tunnel(&tunnel);
 
         if self.config.next_hop.is_some() {
@@ -442,16 +583,23 @@ impl Server {
             };
             match ev {
                 ServerEvent::Stream(acc) => {
+                    hydr_core::metrics::global()
+                        .streams_opened
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(target = %acc.address, "stream accepted");
                     let server = server.clone();
                     tokio::spawn(async move {
                         server.handle_stream(acc).await;
                     });
                 }
                 ServerEvent::Datagram(dg) => {
+                    hydr_core::metrics::global()
+                        .datagrams_rx
+                        .fetch_add(1, Ordering::Relaxed);
                     let server = server.clone();
                     let handle = handle.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = server.handle_datagram(&handle, dg).await {
+                        if let Err(e) = server.handle_datagram(&handle, client_ip, dg).await {
                             tracing::debug!("datagram failed: {e}");
                         }
                     });
@@ -546,6 +694,7 @@ impl Server {
     async fn handle_datagram(
         &self,
         upstream: &TunnelHandle,
+        client_ip: IpAddr,
         dg: Datagram,
     ) -> hydr_core::Result<()> {
         if self.config.next_hop.is_some() {
@@ -557,7 +706,7 @@ impl Server {
                 .ok_or(hydr_core::Error::InvalidData("no next hop"))?;
             downstream.send_datagram(&dg)
         } else {
-            self.udp.forward(upstream, dg).await
+            self.udp.forward(upstream, client_ip, dg).await
         }
     }
 }

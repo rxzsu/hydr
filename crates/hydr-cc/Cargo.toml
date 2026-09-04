@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hydr-core = { version = "0.1.0", path = "../hydr-core" }
 quinn = "0.11"
 quinn-proto = "0.11"
 tracing = "0.1"

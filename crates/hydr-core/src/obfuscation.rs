@@ -113,11 +113,17 @@ impl Obfuscator {
     /// - `Invalid` — плохой MAC / обрезка / мусор (соединение стоит разорвать).
     pub fn decrypt_outcome(&self, buf: &[u8]) -> DecryptOutcome {
         if buf.len() < SALT_LEN + TAG_LEN + 8 {
+            crate::metrics::global()
+                .obfus_invalid
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return DecryptOutcome::Invalid;
         }
         let (salt, rest) = buf.split_at(SALT_LEN);
         let (body, tag) = rest.split_at(rest.len() - TAG_LEN);
         if self.tag(body) != tag {
+            crate::metrics::global()
+                .obfus_invalid
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return DecryptOutcome::Invalid;
         }
         let mut plain = body.to_vec();
@@ -128,6 +134,9 @@ impl Obfuscator {
             Err(_) => return DecryptOutcome::Invalid,
         };
         if !self.recv.lock().unwrap().observe(seq) {
+            crate::metrics::global()
+                .obfus_replay_dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return DecryptOutcome::Replay;
         }
         DecryptOutcome::Ok(payload.to_vec())

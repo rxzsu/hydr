@@ -14,12 +14,18 @@ use quinn_proto::RttEstimator;
 
 /// Минимальное окно — чтобы соединение не вставало до первого ack.
 const MIN_WINDOW_BYTES: u64 = 2 * 1200;
+/// Верхняя граница окна: `rate/8 × RTT` без cap'а при жирной полосе и большом
+/// RTT даёт гигабайтные окна (10 Гбит/с × 1 с = 1.25 ГБ), которыми один клиент
+/// убивает остальных. 64 МБ ≈ 512 Мбит при RTT 1 с — достаточно для
+/// hysteria-подобных сценариев и безопасно для shared-линка.
+pub const MAX_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Окно (в байтах), соответствующее целевой полосе: `rate / 8 * rtt`.
+/// Окно (в байтах), соответствующее целевой полосе: `rate / 8 * rtt`,
+/// зажатое в `[MIN_WINDOW_BYTES, MAX_WINDOW_BYTES]`.
 fn window_for(rate_bps: u64, rtt: Duration) -> u64 {
     let bytes_per_sec = rate_bps / 8;
     let w = (bytes_per_sec as u128 * rtt.as_nanos() / 1_000_000_000) as u64;
-    w.max(MIN_WINDOW_BYTES)
+    w.clamp(MIN_WINDOW_BYTES, MAX_WINDOW_BYTES)
 }
 
 /// Контроллер с фиксированной полосой: потери игнорируются,
@@ -52,6 +58,9 @@ impl Controller for BrutalController {
         rtt: &RttEstimator,
     ) {
         self.window = window_for(self.rate_bps, rtt.get());
+        hydr_core::metrics::global()
+            .cc_window_bytes
+            .store(self.window, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn on_congestion_event(
@@ -129,6 +138,17 @@ mod tests {
     #[test]
     fn window_never_below_minimum() {
         assert_eq!(window_for(1, Duration::from_millis(1)), MIN_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn window_capped_at_maximum() {
+        // 10 Гбит/с × 1 с = 1.25 ГБ без cap'а — должно резаться до MAX_WINDOW_BYTES
+        assert_eq!(
+            window_for(10_000_000_000, Duration::from_secs(1)),
+            MAX_WINDOW_BYTES
+        );
+        // обычное значение ниже cap'а не трогаем
+        assert_eq!(window_for(8_000_000, Duration::from_millis(100)), 100_000);
     }
 
     #[test]

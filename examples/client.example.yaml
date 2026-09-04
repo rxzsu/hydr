@@ -9,6 +9,10 @@ cc_rx: 0
 
 # local SOCKS5 entry
 socks5_bind: "127.0.0.1:1080"
+# SOCKS5 user/pass (RFC 1929). REQUIRED when binding to a non-loopback address,
+# otherwise anyone on the network can use the proxy. Password via env HYDR_SOCKS5_PASSWORD.
+# socks5_username: "user"
+# socks5_password: "change-me-too"
 
 transport:
   type: quic

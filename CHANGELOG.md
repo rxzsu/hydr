@@ -5,6 +5,25 @@
 версии — [Semantic Versioning](https://semver.org/lang/ru/).
 
 ## [Unreleased]
+### Добавлено
+- SOCKS5 user/pass аутентификация (RFC 1929): `socks5_username`/`socks5_password`
+  в конфиге клиента (пароль — через `HYDR_SOCKS5_PASSWORD`); warn при бинде
+  на не-loopback без auth.
+- Prometheus `/metrics` на сервере (`metrics_bind`, например `127.0.0.1:9090`):
+  auth по кодам, replay vs bad-MAC, стримы/датаграммы, UDP-сессии, дропы WS,
+  ожидания flow-control, окно CC. Без внешних зависимостей.
+- Hot-reload QUIC-сертификата без рестарта: SIGHUP (unix) + опрос mtime PEM
+  (все ОС); новый fingerprint логируется, живые соединения не рвутся.
+- UDP caps: `max_udp_sessions` (дефолт 4096) + `max_udp_sessions_per_ip`
+  (дефолт 64); превышение → `[code 0x02]`.
+
+### Безопасность
+- UDP-сессии ключеваны `(owner_ip, session_id)`: чужой клиент больше не может
+  перехватить/вытеснить чужой сокет подбором `session_id`.
+- Brutal-окно зажато в `[2.4 КБ, 64 МБ]`: 10 Гбит/с × 1 с больше не даёт
+  окно 1.25 ГБ, убивающее shared-линк.
+- CI: `cargo audit` / `cargo deny` — блокирующие; еженедельный strict-аудит
+  по расписанию ловит новые CVE в `Cargo.lock` без коммитов.
 
 ## [0.1.0] - 2026-08-28
 ### Добавлено
